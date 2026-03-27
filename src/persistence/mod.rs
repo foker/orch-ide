@@ -1,0 +1,30 @@
+use crate::session::ProjectGroup;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppState {
+    pub projects: Vec<ProjectGroup>,
+    pub theme: String,
+}
+
+fn config_path() -> PathBuf {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude-sessions");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("config.json")
+}
+
+pub fn save(state: &AppState) {
+    let path = config_path();
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        std::fs::write(&path, json).ok();
+    }
+}
+
+pub fn load() -> Option<AppState> {
+    let path = config_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}

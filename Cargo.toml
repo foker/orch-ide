@@ -1,0 +1,32 @@
+[package]
+name = "claude-sessions"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUI framework
+iced = { version = "0.14", features = ["tokio"] }
+
+# Terminal widget (alacritty backend) — local patched version
+iced_term = { path = "iced_term_patched" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# File system watching
+notify = "7"
+
+# Git info
+git2 = "0.19"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Native file dialog
+rfd = "0.17"
+
+# Utils
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }

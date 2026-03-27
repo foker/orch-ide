@@ -1,0 +1,104 @@
+{
+  "name": "claude-agents",
+  "displayName": "Claude Agents",
+  "description": "Manage multiple Claude Code CLI sessions with rich card UI, progress tracking, and terminal integration",
+  "version": "0.1.0",
+  "publisher": "nikitagerasimov",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "claude-agents-panel",
+          "title": "Claude Agents",
+          "icon": "$(terminal)"
+        }
+      ],
+      "activitybar": [
+        {
+          "id": "claude-agents-sidebar",
+          "title": "Claude Agents",
+          "icon": "media/claude-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claude-agents-sidebar": [
+        {
+          "type": "webview",
+          "id": "claudeAgents.cardPanel",
+          "name": "Sessions"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claudeAgents.newSession",
+        "title": "New Session",
+        "category": "Claude Agents",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claudeAgents.killSession",
+        "title": "Kill Session",
+        "category": "Claude Agents"
+      },
+      {
+        "command": "claudeAgents.focusPanel",
+        "title": "Focus Panel",
+        "category": "Claude Agents"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Agents",
+      "properties": {
+        "claudeAgents.panelPosition": {
+          "type": "string",
+          "default": "sidebar",
+          "enum": [
+            "sidebar",
+            "panel"
+          ],
+          "description": "Where to show the Claude Agents cards panel"
+        },
+        "claudeAgents.autoConfigureHooks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically configure Claude Code hooks for progress tracking"
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claudeAgents.newSession",
+          "when": "view == claudeAgents.cardPanel",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

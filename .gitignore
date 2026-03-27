@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.vsix
+.vscode-test/
+out/
+
+# Rust
+/target
+
+# macOS app bundle binary (rebuild with cargo build --release)
+bundle/ClaudeSessions.app/Contents/MacOS/claude-sessions
+
+# iced_term patched docs/examples (keep source only)
+iced_term_patched/docs/
+iced_term_patched/examples/
+iced_term_patched/.cargo-ok
+iced_term_patched/.cargo_vcs_info.json
+
+# OS
+.DS_Store

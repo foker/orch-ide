@@ -95,7 +95,8 @@ pub struct SubRepoView {
     pub name: String,
     pub branch: String,
     pub dirty_files: u32,
-    pub has_unmerged_pr: bool, // true = blue dot, false = grey/none
+    pub has_unmerged_pr: bool,
+    pub pr_number: String, // e.g. "#466" or ""
 }
 
 impl ProjectGroup {

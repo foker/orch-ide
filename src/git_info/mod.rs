@@ -121,9 +121,9 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
 
 /// Check PR status for a branch using `gh` CLI
 fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
-    // gh pr list --head <branch> --json number,state --limit 1
+    // Compatible with gh 2.0+: get all PRs and filter by headRefName
     let output = Command::new("gh")
-        .args(["pr", "list", "--head", branch, "--json", "number,state", "--limit", "1", "--state", "all"])
+        .args(["pr", "list", "--state", "all", "--json", "number,state,headRefName", "--limit", "50"])
         .current_dir(repo_path)
         .output();
 
@@ -131,24 +131,31 @@ fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
     if !out.status.success() { return PrStatus::None; }
 
     let text = String::from_utf8_lossy(&out.stdout);
-    // Parse JSON array: [{"number":42,"state":"OPEN"}]
     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
-        if let Some(pr) = arr.first() {
-            let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
-            let state = pr.get("state").and_then(|s| s.as_str()).unwrap_or("");
-            let label = format!("#{}", number);
-            return match state {
-                "OPEN" => PrStatus::Open(label),
-                "MERGED" => PrStatus::Merged(label),
-                _ => PrStatus::None,
-            };
+        // Find PR matching our branch
+        for pr in &arr {
+            let head = pr.get("headRefName").and_then(|s| s.as_str()).unwrap_or("");
+            if head == branch {
+                let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+                let state = pr.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                let label = format!("#{}", number);
+                return match state {
+                    "OPEN" => PrStatus::Open(label),
+                    "MERGED" => PrStatus::Merged(label),
+                    _ => PrStatus::None,
+                };
+            }
         }
     }
 
     PrStatus::None
 }
 
-/// Find directories containing `.git` up to max_depth
+/// Find directories containing `.git` up to max_depth (public wrapper)
+pub fn find_git_repos_pub(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    find_git_repos(root, max_depth)
+}
+
 fn find_git_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut repos = Vec::new();
 

@@ -6,7 +6,11 @@ use std::path::PathBuf;
 pub struct AppState {
     pub projects: Vec<ProjectGroup>,
     pub theme: String,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
 }
+
+fn default_sidebar_width() -> f32 { 280.0 }
 
 fn config_path() -> PathBuf {
     let dir = dirs::home_dir()

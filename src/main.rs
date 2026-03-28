@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
+const SESSION_INPUT_ID: &str = "session-name-input";
 
 fn main() -> iced::Result {
     logging::init();
@@ -149,9 +150,13 @@ enum Message {
     NewProject, NewProjectFolderPicked(Option<PathBuf>),
     AddSession(usize), SessionNameSubmit(usize, String), SessionNameChanged(String),
     ToggleLaunchClaude,
-    SelectSession(usize, usize), KillSession(usize, usize), RemoveProject(usize), ToggleProjectExpand(usize),
+    SelectSession(usize, usize), KillSession(usize, usize), MakeIdle(usize, usize),
+    StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
+    RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
+    OpenFile(PathBuf),
     ResizeSidebar(f32),
-    ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick,
+    ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
+    KeyboardEvent(iced::keyboard::Event),
     ToggleSettings, SetTheme(AppTheme),
     TermEvent(iced_term::Event),
 }
@@ -172,9 +177,13 @@ struct App {
     new_project_parent: Option<PathBuf>, // parent folder for "+" new project flow
     launch_claude: bool,
     show_settings: bool,
+    confirm_delete: Option<(usize, Vec<String>)>,
+    renaming_session: Option<(usize, usize)>, // (pi, si)
+    rename_input: String,
     current_theme: AppTheme,
     sidebar_width: f32,
     tick_count: u32,
+    blink_on: bool,
 }
 
 impl Default for App {
@@ -184,7 +193,8 @@ impl Default for App {
             file_entries: Vec::new(), terminals: Vec::new(), next_term_id: 0,
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
             launch_claude: true,
-            show_settings: false, current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0,
+            show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(),
+            current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
     }
 }
@@ -210,6 +220,7 @@ impl App {
                 "Catppuccin" => AppTheme::Catppuccin,
                 _ => AppTheme::Midnight,
             };
+            app.sidebar_width = state.sidebar_width;
             // Refresh git info
             for p in &mut app.projects {
                 if let Some(info) = git_info::get_git_info_with_pr(&p.path) {
@@ -246,11 +257,23 @@ impl App {
             (std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()), vec![])
         };
 
+        let mut env = std::collections::HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // Inherit PATH from user shell
+        if let Ok(path) = std::env::var("PATH") {
+            env.insert("PATH".to_string(), path);
+        } else {
+            env.insert("PATH".to_string(), format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
+                dirs::home_dir().unwrap_or_default().display()));
+        }
+
         let settings = iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
                 program,
                 args,
                 working_directory: Some(cwd),
+                env,
                 ..Default::default()
             },
             ..Default::default()
@@ -271,6 +294,7 @@ impl App {
         persistence::save(&persistence::AppState {
             projects: self.projects.clone(),
             theme: format!("{:?}", self.current_theme),
+            sidebar_width: self.sidebar_width,
         });
     }
 
@@ -311,20 +335,22 @@ impl App {
                         self.save_state();
                     }
                 }
-                Task::none()
+                iced::widget::operation::focus_next()
             }
             Message::NewProjectFolderPicked(path) => {
                 if let Some(parent) = path {
                     self.new_project_parent = Some(parent);
-                    // Show session name dialog (no project created yet — will create on submit)
                     self.session_name_input = String::new();
-                    self.show_session_dialog = Some(usize::MAX); // sentinel: means "new project"
+                    self.show_session_dialog = Some(usize::MAX);
                     self.launch_claude = true;
                 }
-                Task::none()
+                iced::widget::operation::focus_next()
             }
             Message::ToggleLaunchClaude => { self.launch_claude = !self.launch_claude; Task::none() }
-            Message::AddSession(pi) => { self.show_session_dialog = Some(pi); Task::none() }
+            Message::AddSession(pi) => {
+                self.show_session_dialog = Some(pi);
+                iced::widget::operation::focus_next()
+            }
             Message::SessionNameChanged(n) => { self.session_name_input = n; Task::none() }
             Message::SessionNameSubmit(pi, name) => {
                 app_log!("SessionNameSubmit: pi={} name={}", pi, name);
@@ -382,6 +408,13 @@ impl App {
                 }
                 Task::none()
             }
+            Message::MakeIdle(pi, si) => {
+                if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
+                    self.projects[pi].sessions[si].status = SessionStatus::Idle;
+                    self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
+                }
+                Task::none()
+            }
             Message::KillSession(pi, si) => {
                 app_log!("KillSession: pi={} si={}", pi, si);
                 // Remove terminal
@@ -431,6 +464,70 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            Message::DeleteProjectDir(pi) => {
+                if pi < self.projects.len() {
+                    let path = &self.projects[pi].path;
+                    // Collect uncommitted files from all sub-repos
+                    let mut uncommitted = Vec::new();
+                    let git_dirs = git_info::find_git_repos_pub(path, 3);
+                    for gd in &git_dirs {
+                        if let Ok(out) = std::process::Command::new("git")
+                            .args(["status", "--porcelain"])
+                            .current_dir(gd)
+                            .output()
+                        {
+                            let prefix = gd.strip_prefix(path).unwrap_or(gd);
+                            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                                if !line.is_empty() {
+                                    let file = line.get(3..).unwrap_or(line);
+                                    uncommitted.push(format!("{}/{}", prefix.display(), file));
+                                }
+                            }
+                        }
+                    }
+                    self.confirm_delete = Some((pi, uncommitted));
+                }
+                Task::none()
+            }
+            Message::ConfirmDeleteDir(pi) => {
+                if pi < self.projects.len() {
+                    let path = self.projects[pi].path.clone();
+                    app_log!("DELETING directory: {:?}", path);
+                    if let Err(e) = std::fs::remove_dir_all(&path) {
+                        app_log!("Failed to delete: {}", e);
+                    }
+                    // Also remove from projects list
+                    self.confirm_delete = None;
+                    return self.update(Message::RemoveProject(pi));
+                }
+                self.confirm_delete = None;
+                Task::none()
+            }
+            Message::StartRenameSession(pi, si) => {
+                if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
+                    self.rename_input = self.projects[pi].sessions[si].name.clone();
+                    self.renaming_session = Some((pi, si));
+                }
+                iced::widget::operation::focus_next()
+            }
+            Message::RenameSessionInput(s) => { self.rename_input = s; Task::none() }
+            Message::RenameSessionSubmit => {
+                if let Some((pi, si)) = self.renaming_session {
+                    if pi < self.projects.len() && si < self.projects[pi].sessions.len() && !self.rename_input.is_empty() {
+                        self.projects[pi].sessions[si].name = self.rename_input.clone();
+                        self.save_state();
+                    }
+                }
+                self.renaming_session = None;
+                self.rename_input.clear();
+                Task::none()
+            }
+            Message::OpenFile(path) => {
+                app_log!("OpenFile: {:?}", path);
+                let _ = std::process::Command::new("open").arg(&path).spawn();
+                Task::none()
+            }
+            Message::CancelDelete => { self.confirm_delete = None; Task::none() }
             Message::ToggleProjectExpand(_) => Task::none(),
             Message::ToggleFileExpand(idx) => {
                 if idx < self.file_entries.len() && matches!(self.file_entries[idx].kind, explorer::FileEntryKind::Directory) {
@@ -451,6 +548,24 @@ impl App {
             }
             Message::RefreshExplorer => {
                 if let Some(pi) = self.active_project { self.file_entries = explorer::read_directory(&self.projects[pi].path, 0); }
+                Task::none()
+            }
+            Message::Blink => {
+                self.blink_on = !self.blink_on;
+                Task::none()
+            }
+            Message::KeyboardEvent(event) => {
+                if let iced::keyboard::Event::KeyPressed { key, modifiers, physical_key, .. } = event {
+                    if modifiers.command() {
+                        // Use physical key for non-latin layouts
+                        let latin = key.to_latin(physical_key);
+                        match latin {
+                            Some('o') => return self.update(Message::OpenProject),
+                            Some('n') => return self.update(Message::NewProject),
+                            _ => {}
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::Tick => {
@@ -482,6 +597,7 @@ impl App {
             }
             Message::ResizeSidebar(delta) => {
                 self.sidebar_width = (self.sidebar_width + delta).clamp(180.0, 500.0);
+                self.save_state();
                 Task::none()
             }
             Message::ToggleSettings => { self.show_settings = !self.show_settings; Task::none() }
@@ -503,7 +619,13 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let tc = self.tc();
-        let center = if self.show_settings { self.view_settings() } else { self.view_terminal() };
+        let center = if let Some((pi, ref files)) = self.confirm_delete {
+            self.view_confirm_delete(pi, files)
+        } else if self.show_settings {
+            self.view_settings()
+        } else {
+            self.view_terminal()
+        };
 
         let tc1 = tc.clone();
         let tc2 = tc.clone();
@@ -515,7 +637,7 @@ impl App {
                 .style(move |_: &Theme| styled_panel(&tc1)),
             container(center).width(Fill).height(Fill)
                 .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(tc2.bg_terminal)), ..Default::default()
+                    background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
                 }),
             container(self.view_explorer()).width(260).height(Fill)
                 .style(move |_: &Theme| styled_panel(&tc3)),
@@ -540,14 +662,12 @@ impl App {
             row![
                 text("SESSIONS").size(10).font(Font::DEFAULT).color(tc.text_muted),
                 Space::new().width(Fill),
-                button(text("◂").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(-40.0)).style(button::text).padding(2),
-                button(text("▸").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(40.0)).style(button::text).padding(2),
-                button(text("⟳").size(13).color(tc.text_muted)).on_press(Message::RefreshAll).style(button::text).padding(2),
-                button(text("◂").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(-40.0)).style(button::text).padding(2),
-                button(text("▸").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(40.0)).style(button::text).padding(2),
-                button(text("⚙").size(13).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(2),
-                button(text("📁").size(12)).on_press(Message::OpenProject).style(button::text).padding(2),
-                button(text("+").size(14).color(tc.text_muted)).on_press(Message::NewProject).style(button::text).padding(2),
+                tip(button(text("⟳").size(13).color(tc.text_muted)).on_press(Message::RefreshAll).style(button::text).padding(2), "Refresh git & PR"),
+                tip(button(text("◂").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(-40.0)).style(button::text).padding(2), "Shrink"),
+                tip(button(text("▸").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(40.0)).style(button::text).padding(2), "Expand"),
+                tip(button(text("⚙").size(13).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(2), "Settings"),
+                tip(button(text("📁").size(12)).on_press(Message::OpenProject).style(button::text).padding(2), "Open folder (⌘O)"),
+                tip(button(text("+").size(14).color(tc.text_muted)).on_press(Message::NewProject).style(button::text).padding(2), "New project (⌘N)"),
             ].spacing(4).align_y(iced::Alignment::Center),
         ).padding([10, 14]);
 
@@ -564,6 +684,7 @@ impl App {
             content = content.push(container(column![
                 text(format!("New project in: {}/", parent_name)).size(11).color(tc.text_secondary),
                 text_input("project-name", &self.session_name_input)
+                    .id(SESSION_INPUT_ID)
                     .on_input(Message::SessionNameChanged)
                     .on_submit(Message::SessionNameSubmit(usize::MAX, self.session_name_input.clone()))
                     .size(12).padding(6),
@@ -588,21 +709,7 @@ impl App {
 
         for &pi in &sorted_project_indices {
             let project = &self.projects[pi];
-            // Project header with remove button
-            content = content.push(
-                row![
-                    button(row![
-                        text("▾").size(11).color(tc.text_muted),
-                        text(&project.name).size(11).color(tc.text_secondary),
-                    ].spacing(6))
-                    .on_press(Message::ToggleProjectExpand(pi)).style(button::text).padding([4, 8])
-                    .width(Fill),
-                    button(text("✕").size(10).color(tc.text_muted))
-                        .on_press(Message::RemoveProject(pi))
-                        .style(button::text)
-                        .padding([4, 6]),
-                ].align_y(iced::Alignment::Center)
-            );
+            // No project header — sessions shown directly
 
             // Session cards (sorted: AWAIT first, IDLE middle, RUN last)
             let mut sorted_indices: Vec<usize> = (0..project.sessions.len()).collect();
@@ -615,23 +722,32 @@ impl App {
 
                 // Top row: dot + name + agents + status + kill btn
                 let mut top = Row::new().spacing(6).align_y(iced::Alignment::Center);
-                top = top.push(text("●").size(8).color(sc));
-                top = top.push(text(&session.name).size(13).color(tc.text_primary));
+                // Pulsing dot for AWAIT status
+                let dot_color = if session.status == SessionStatus::AwaitingInput && !self.blink_on {
+                    Color { a: 0.3, ..sc }
+                } else {
+                    sc
+                };
+                top = top.push(text("●").size(8).color(dot_color));
+                // Session name: inline rename if double-clicked, otherwise clickable text
+                if self.renaming_session == Some((pi, si)) {
+                    top = top.push(
+                        text_input("name", &self.rename_input)
+                            .on_input(Message::RenameSessionInput)
+                            .on_submit(Message::RenameSessionSubmit)
+                            .size(13).padding(2).width(Fill)
+                    );
+                } else {
+                    top = top.push(
+                        button(text(&session.name).size(13).color(tc.text_primary))
+                            .on_press(Message::StartRenameSession(pi, si))
+                            .style(button::text).padding(0)
+                    );
+                }
                 if session.background_agents > 0 {
                     top = top.push(text(format!("🤖{}", session.background_agents)).size(10).color(tc.green));
                 }
                 top = top.push(Space::new().width(Fill));
-                // Status badge
-                let status_bg = Color { a: 0.15, ..sc };
-                top = top.push(
-                    container(text(session.status.to_string()).size(9).color(sc))
-                        .padding([2, 6])
-                        .style(move |_: &Theme| container::Style {
-                            background: Some(Background::Color(status_bg)),
-                            border: Border { radius: 3.0.into(), ..Default::default() },
-                            ..Default::default()
-                        })
-                );
 
                 // Meta: show sub-repos with branches, or single branch
                 let meta: Element<'_, Message> = if project.sub_repos.len() > 1 {
@@ -665,35 +781,47 @@ impl App {
                     if project.dirty_files > 0 {
                         r = r.push(text(format!("{} files", project.dirty_files)).size(10).font(MONO_FONT).color(tc.orange));
                     } else {
-                        r = r.push(text("✓ clean").size(10).font(MONO_FONT).color(tc.green));
+                        r = r.push(text("✓ clean").size(10).font(MONO_FONT).color(tc.text_muted));
                     }
                     r.into()
                 };
 
-                let card_content = column![top, meta].spacing(6);
-
                 let border_c = if is_active { t.border_active } else { t.border };
                 let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
-                let card_container = container(card_content)
-                    .padding([10, 12])
-                    .width(Fill)
-                    .style(move |_: &Theme| container::Style {
-                        background: Some(Background::Color(bg_c)),
-                        border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
-                        ..Default::default()
-                    });
+                let hover_bg = t.bg_card_hover;
 
                 // Card row: [card button] [kill button]
                 let card_row = row![
-                    button(card_container)
+                    button(column![top, meta].spacing(6))
                         .on_press(Message::SelectSession(pi, si))
-                        .style(button::text)
-                        .padding(0)
+                        .style(move |_: &Theme, status: button::Status| {
+                            let bg = match status {
+                                button::Status::Hovered | button::Status::Pressed => hover_bg,
+                                _ => bg_c,
+                            };
+                            button::Style {
+                                background: Some(Background::Color(bg)),
+                                border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
+                                text_color: Color::WHITE,
+                                ..Default::default()
+                            }
+                        })
+                        .padding([10, 12])
                         .width(Fill),
-                    button(text("✕").size(11).color(tc.text_muted))
-                        .on_press(Message::KillSession(pi, si))
-                        .style(button::text)
-                        .padding([8, 6]),
+                    column![
+                        tip(button(text("✕").size(11).color(tc.text_muted))
+                                .on_press(Message::KillSession(pi, si))
+                                .style(button::text).padding([4, 6]),
+                            "Kill session"),
+                        tip(button(text("◼").size(9).color(tc.text_muted))
+                                .on_press(Message::MakeIdle(pi, si))
+                                .style(button::text).padding([4, 6]),
+                            "Set idle"),
+                        tip(button(text("🗑").size(9))
+                                .on_press(Message::DeleteProjectDir(pi))
+                                .style(button::text).padding([4, 6]),
+                            "Delete folder"),
+                    ].spacing(0),
                 ].align_y(iced::Alignment::Start);
 
                 content = content.push(
@@ -709,6 +837,7 @@ impl App {
                 content = content.push(
                     container(column![
                         text_input("Session name...", &self.session_name_input)
+                            .id(SESSION_INPUT_ID)
                             .on_input(Message::SessionNameChanged)
                             .on_submit(Message::SessionNameSubmit(pi, self.session_name_input.clone()))
                             .size(12).padding(6),
@@ -721,13 +850,14 @@ impl App {
                     ].spacing(4))
                     .padding(Padding { top: 4.0, right: 4.0, bottom: 4.0, left: 20.0 })
                 );
-            } else {
-                content = content.push(
-                    button(text("+ add session").size(10).color(tc.text_muted))
-                        .on_press(Message::AddSession(pi)).style(button::text).padding([4, 20])
-                );
             }
-            content = content.push(rule::horizontal(1));
+            // TODO: temporarily hidden
+            // } else {
+            //     content = content.push(
+            //         button(text("+ add session").size(10).color(tc.text_muted))
+            //             .on_press(Message::AddSession(pi)).style(button::text).padding([4, 20])
+            //     );
+            // }
         }
 
         // Empty state
@@ -775,15 +905,17 @@ impl App {
         let mut info_chips = Row::new().spacing(8).align_y(iced::Alignment::Center);
         info_chips = info_chips.push(chip(status_text, sc));
         info_chips = info_chips.push(chip(&format!("⎇ {}", project.branch), tc.purple));
-        // PR dot in info bar
+        // PR link in info bar
         if let Some(sr) = project.sub_repos.first() {
-            let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-            info_chips = info_chips.push(text("⬤").size(8).color(pr_color));
+            if !sr.pr_number.is_empty() {
+                let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
+                info_chips = info_chips.push(chip(&sr.pr_number, pr_color));
+            }
         }
         if project.dirty_files > 0 {
             info_chips = info_chips.push(chip(&format!("✎ {} uncommitted", project.dirty_files), tc.orange));
         } else {
-            info_chips = info_chips.push(chip("✓ clean", tc.green));
+            info_chips = info_chips.push(chip("✓ clean", tc.text_muted));
         }
         if session.background_agents > 0 {
             info_chips = info_chips.push(chip(&format!("🤖 {} agents", session.background_agents), tc.green));
@@ -837,12 +969,16 @@ impl App {
                 explorer::GitStatus::Deleted => tc.red,
                 _ => color,
             };
+            let msg = match entry.kind {
+                explorer::FileEntryKind::Directory => Message::ToggleFileExpand(idx),
+                explorer::FileEntryKind::File => Message::OpenFile(entry.path.clone()),
+            };
             tree = tree.push(
                 button(row![
                     text(icon).size(12).font(MONO_FONT).color(color),
                     text(&entry.name).size(12).font(MONO_FONT).color(color),
                 ].spacing(6))
-                .on_press(Message::ToggleFileExpand(idx)).style(button::text)
+                .on_press(msg).style(button::text)
                 .padding([2, 6 + indent])
             );
         }
@@ -895,10 +1031,56 @@ impl App {
         ]).center_x(Fill).height(Fill).into()
     }
 
+    fn view_confirm_delete(&self, pi: usize, files: &[String]) -> Element<'_, Message> {
+        let tc = self.tc();
+        let dir_name = self.projects.get(pi)
+            .map(|p| p.path.display().to_string())
+            .unwrap_or_default();
+
+        let mut content = Column::new().spacing(12).padding(24).max_width(600);
+        content = content.push(text("Delete Directory?").size(18).color(tc.text_primary));
+        content = content.push(text(dir_name).size(12).font(MONO_FONT).color(tc.text_secondary));
+
+        if files.is_empty() {
+            content = content.push(text("No uncommitted changes.").size(12).color(tc.text_muted));
+        } else {
+            content = content.push(
+                text(format!("{} uncommitted files:", files.len())).size(12).color(tc.orange)
+            );
+            let mut file_list = Column::new().spacing(2);
+            for (i, f) in files.iter().take(20).enumerate() {
+                file_list = file_list.push(text(f.clone()).size(11).font(MONO_FONT).color(tc.orange));
+            }
+            if files.len() > 20 {
+                file_list = file_list.push(text(format!("... and {} more", files.len() - 20)).size(11).color(tc.text_muted));
+            }
+            content = content.push(scrollable(file_list).height(200));
+        }
+
+        content = content.push(
+            row![
+                button(text("Cancel").size(13).color(tc.text_primary))
+                    .on_press(Message::CancelDelete)
+                    .style(button::secondary)
+                    .padding([8, 20]),
+                Space::new().width(12),
+                button(text("Delete").size(13).color(tc.red))
+                    .on_press(Message::ConfirmDeleteDir(pi))
+                    .style(button::secondary)
+                    .padding([8, 20]),
+            ]
+        );
+
+        container(content).center(Fill).height(Fill).into()
+    }
+
     fn theme(&self) -> Theme { Theme::Dark }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut subs = vec![iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick)];
+        let mut subs = vec![
+            iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
+            iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
+        ];
         for (_, ti) in &self.terminals { subs.push(ti.terminal.subscription().map(Message::TermEvent)); }
         Subscription::batch(subs)
     }
@@ -924,16 +1106,39 @@ fn styled_card(tc: &TC) -> container::Style {
 
 /// Convert git_info sub_repos to session SubRepoView
 fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
-    info.sub_repos.iter().map(|r| session::SubRepoView {
-        name: r.name.clone(),
-        branch: r.branch.clone(),
-        dirty_files: r.dirty_files,
-        has_unmerged_pr: matches!(r.pr, git_info::PrStatus::Open(_)),
+    info.sub_repos.iter().map(|r| {
+        let (has_unmerged, pr_num) = match &r.pr {
+            git_info::PrStatus::Open(n) => (true, n.clone()),
+            git_info::PrStatus::Merged(n) => (false, n.clone()),
+            git_info::PrStatus::None => (false, String::new()),
+        };
+        session::SubRepoView {
+            name: r.name.clone(),
+            branch: r.branch.clone(),
+            dirty_files: r.dirty_files,
+            has_unmerged_pr: has_unmerged,
+            pr_number: pr_num,
+        }
     }).collect()
 }
 
 /// Find claude binary path
 fn which_claude() -> String {
+    // Try common paths first (macOS .app bundle has limited PATH)
+    let candidates = [
+        dirs::home_dir().map(|h| h.join(".local/bin/claude").to_string_lossy().to_string()),
+        dirs::home_dir().map(|h| h.join(".claude/bin/claude").to_string_lossy().to_string()),
+        Some("/usr/local/bin/claude".to_string()),
+        Some("/opt/homebrew/bin/claude".to_string()),
+    ];
+    for candidate in &candidates {
+        if let Some(path) = candidate {
+            if std::path::Path::new(path).exists() {
+                return path.clone();
+            }
+        }
+    }
+    // Fallback to which
     std::process::Command::new("which")
         .arg("claude")
         .output()
@@ -941,6 +1146,20 @@ fn which_claude() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "claude".to_string())
+}
+
+fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: &str) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        content,
+        container(text(hint.to_string()).size(11).color(Color::from_rgb(0.8, 0.8, 0.85)))
+            .padding([3, 8])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.25))),
+                border: Border { color: Color::from_rgb(0.3, 0.3, 0.35), width: 1.0, radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            }),
+        iced::widget::tooltip::Position::Bottom,
+    ).into()
 }
 
 fn chip<'a>(label: &str, color: Color) -> Element<'a, Message> {

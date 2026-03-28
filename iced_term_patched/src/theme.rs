@@ -43,8 +43,8 @@ impl Default for ColorPalette {
     fn default() -> Self {
         Self {
             foreground: String::from("#d8d8d8"),
-            background: String::from("#181818"),
-            black: String::from("#181818"),
+            background: String::from("#171b21"),
+            black: String::from("#171b21"),
             red: String::from("#ac4242"),
             green: String::from("#90a959"),
             yellow: String::from("#f4bf75"),

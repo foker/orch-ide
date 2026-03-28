@@ -18,3 +18,4 @@ iced_term_patched/.cargo_vcs_info.json
 
 # OS
 .DS_Store
+bundle/ClaudeSessions.app/Contents/Resources/AppIcon.icns.bak

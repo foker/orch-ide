@@ -145,7 +145,6 @@ pub async fn transcribe_groq(wav_data: Vec<u8>, api_key: &str) -> Result<String,
 
     let form = reqwest::multipart::Form::new()
         .text("model", "whisper-large-v3-turbo")
-        .text("language", "en")
         .part("file", part);
 
     let resp = client

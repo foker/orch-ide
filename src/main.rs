@@ -155,6 +155,11 @@ enum Message {
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
     RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
     OpenFile(PathBuf),
+    // Deployments
+    FetchDeployments(usize), // project index
+    DeploymentsFetched(usize, Vec<(String, Vec<(String, String, String)>)>), // pi, vec of (sub_repo_name, deployments)
+    ToggleDeploymentDropdown,
+    OpenUrl(String),
     // Voice
     VoiceToggle, VoiceResult(Result<String, String>),
     GroqKeyChanged(String),
@@ -184,6 +189,8 @@ struct App {
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
     rename_input: String,
+    // Deployments
+    show_deployment_dropdown: bool,
     // Voice
     voice_recorder: voice::AudioRecorder,
     groq_api_key: String,
@@ -202,6 +209,7 @@ impl Default for App {
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
             launch_claude: true,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(),
+            show_deployment_dropdown: false,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
@@ -412,12 +420,14 @@ impl App {
                 self.active_session = Some((pi, si));
                 self.active_project = Some(pi);
                 self.file_entries = explorer::read_directory(&self.projects[pi].path, 0);
+                self.show_deployment_dropdown = false;
                 // Spawn terminal if it doesn't exist (e.g. after restart)
                 let has_term = self.terminals.iter().any(|(k, _)| *k == (pi, si));
                 if !has_term && pi < self.projects.len() && si < self.projects[pi].sessions.len() {
                     self.spawn_session_terminal(pi, si, true);
                 }
-                Task::none()
+                // Fetch deployments async
+                return self.update(Message::FetchDeployments(pi));
             }
             Message::MakeIdle(pi, si) => {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
@@ -535,6 +545,58 @@ impl App {
                 }
                 self.renaming_session = None;
                 self.rename_input.clear();
+                Task::none()
+            }
+            Message::FetchDeployments(pi) => {
+                if pi >= self.projects.len() { return Task::none(); }
+                let sub_repos: Vec<(String, PathBuf)> = {
+                    let git_dirs = git_info::find_git_repos_pub(&self.projects[pi].path, 3);
+                    git_dirs.iter().map(|gd| {
+                        let name = gd.strip_prefix(&self.projects[pi].path)
+                            .map(|p| { let s = p.to_string_lossy().to_string(); if s.is_empty() { ".".to_string() } else { s } })
+                            .unwrap_or_else(|_| ".".to_string());
+                        (name, gd.clone())
+                    }).collect()
+                };
+                app_log!("FetchDeployments: pi={} repos={}", pi, sub_repos.len());
+                Task::perform(
+                    async move {
+                        let mut results = Vec::new();
+                        for (name, path) in sub_repos {
+                            let deps = git_info::get_deployments(&path);
+                            if !deps.is_empty() {
+                                results.push((name, deps));
+                            }
+                        }
+                        (pi, results)
+                    },
+                    |(pi, deps)| Message::DeploymentsFetched(pi, deps),
+                )
+            }
+            Message::DeploymentsFetched(pi, deps) => {
+                app_log!("DeploymentsFetched: pi={} total={}", pi, deps.iter().map(|(_, d)| d.len()).sum::<usize>());
+                if pi < self.projects.len() {
+                    for sr in &mut self.projects[pi].sub_repos {
+                        sr.deployments.clear();
+                        for (name, repo_deps) in &deps {
+                            if *name == sr.name {
+                                sr.deployments = repo_deps.iter().map(|(env, state, url)| {
+                                    session::DeploymentInfo {
+                                        env: env.clone(), state: state.clone(), url: url.clone(),
+                                    }
+                                }).collect();
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleDeploymentDropdown => {
+                self.show_deployment_dropdown = !self.show_deployment_dropdown;
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                let _ = std::process::Command::new("open").arg(&url).spawn();
                 Task::none()
             }
             Message::OpenFile(path) => {
@@ -984,6 +1046,47 @@ impl App {
         if session.background_agents > 0 {
             info_chips = info_chips.push(chip(&format!("🤖 {} agents", session.background_agents), tc.green));
         }
+        // Deployments
+        let all_deps: Vec<&session::DeploymentInfo> = project.sub_repos.iter()
+            .flat_map(|sr| sr.deployments.iter())
+            .collect();
+        if !all_deps.is_empty() {
+            let first = &all_deps[0];
+            let dep_icon = match first.state.as_str() {
+                "success" => "🟢",
+                "failure" | "error" => "🔴",
+                "in_progress" | "pending" => "⏳",
+                _ => "⚪",
+            };
+            if !first.url.is_empty() {
+                let url = first.url.clone();
+                // Shorten URL for display
+                let short = first.url.replace("https://", "").chars().take(35).collect::<String>();
+                info_chips = info_chips.push(
+                    button(text(format!("{} {}", dep_icon, short)).size(10).font(MONO_FONT).color(tc.blue))
+                        .on_press(Message::OpenUrl(url))
+                        .style(button::text).padding([2, 4])
+                );
+            } else {
+                info_chips = info_chips.push(text(format!("{} {}", dep_icon, first.env)).size(10).color(tc.text_muted));
+            }
+            if all_deps.len() > 1 {
+                info_chips = info_chips.push(
+                    button(text(format!("+{} more", all_deps.len() - 1)).size(10).color(tc.text_secondary))
+                        .on_press(Message::ToggleDeploymentDropdown)
+                        .style(button::text).padding([2, 4])
+                );
+            }
+        }
+        // Refresh deployments button
+        let pi_for_refresh = pi;
+        info_chips = info_chips.push(
+            tip(button(text("⟳").size(10).color(tc.text_muted))
+                .on_press(Message::FetchDeployments(pi_for_refresh))
+                .style(button::text).padding([2, 4]),
+                "Refresh deployments")
+        );
+
         info_chips = info_chips.push(Space::new().width(Fill));
         info_chips = info_chips.push(text(project.path.display().to_string()).size(11).font(MONO_FONT).color(tc.text_muted));
 
@@ -993,6 +1096,36 @@ impl App {
                 border: Border { color: t.border, width: 0.0, ..Default::default() },
                 ..Default::default()
             });
+
+        // Deployment dropdown
+        let deployment_dropdown: Option<Element<'_, Message>> = if self.show_deployment_dropdown && !all_deps.is_empty() {
+            let mut list = Column::new().spacing(2).padding(4);
+            for dep in &all_deps {
+                let icon = match dep.state.as_str() {
+                    "success" => "🟢", "failure" | "error" => "🔴",
+                    "in_progress" | "pending" => "⏳", _ => "⚪",
+                };
+                if !dep.url.is_empty() {
+                    let url = dep.url.clone();
+                    let short_url = dep.url.replace("https://", "");
+                    list = list.push(
+                        button(text(format!("{} {} — {}", icon, dep.env, short_url)).size(10).font(MONO_FONT).color(tc.blue))
+                            .on_press(Message::OpenUrl(url))
+                            .style(button::text).padding([3, 8])
+                    );
+                } else {
+                    list = list.push(text(format!("{} {}", icon, dep.env)).size(10).color(tc.text_muted));
+                }
+            }
+            let t2 = tc.clone();
+            Some(container(list).style(move |_: &Theme| container::Style {
+                background: Some(Background::Color(t2.bg_card)),
+                border: Border { color: t2.border, width: 1.0, radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            }).into())
+        } else {
+            None
+        };
 
         // Terminal widget (hide when session dialog is open to prevent keyboard conflict)
         let terminal_view: Element<'_, Message> = if self.show_session_dialog.is_some() {
@@ -1035,7 +1168,15 @@ impl App {
             ].spacing(6).padding([2, 8]).align_y(iced::Alignment::Center),
         );
 
-        column![info_bar, rule::horizontal(1), terminal_view, voice_bar].into()
+        let mut main_col = Column::new();
+        main_col = main_col.push(info_bar);
+        if let Some(dropdown) = deployment_dropdown {
+            main_col = main_col.push(dropdown);
+        }
+        main_col = main_col.push(rule::horizontal(1));
+        main_col = main_col.push(terminal_view);
+        main_col = main_col.push(voice_bar);
+        main_col.into()
     }
 
     fn view_explorer(&self) -> Element<'_, Message> {
@@ -1223,6 +1364,7 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
             dirty_files: r.dirty_files,
             has_unmerged_pr: has_unmerged,
             pr_number: pr_num,
+            deployments: Vec::new(),
         }
     }).collect()
 }

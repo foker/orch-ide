@@ -151,6 +151,73 @@ fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
     PrStatus::None
 }
 
+/// Fetch deployments for a branch via gh API
+pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
+    // (env, state, url)
+    let sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if sha.is_empty() { return Vec::new(); }
+
+    // Get repo name
+    let repo_name = Command::new("gh")
+        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if repo_name.is_empty() { return Vec::new(); }
+
+    // Get deployments for this SHA
+    let endpoint = format!("repos/{}/deployments?sha={}&per_page=5", repo_name, sha);
+    let output = Command::new("gh")
+        .args(["api", &endpoint])
+        .current_dir(repo_path)
+        .output();
+
+    let Ok(out) = output else { return Vec::new(); };
+    if !out.status.success() { return Vec::new(); }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(deployments) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return Vec::new(); };
+
+    let mut results = Vec::new();
+    for d in &deployments {
+        let env = d.get("environment").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let statuses_url = d.get("statuses_url").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Fetch status
+        if !statuses_url.is_empty() {
+            // Extract path from URL for gh api
+            let path = statuses_url.replace("https://api.github.com/", "");
+            if let Ok(st_out) = Command::new("gh").args(["api", &path]).current_dir(repo_path).output() {
+                if st_out.status.success() {
+                    let st_text = String::from_utf8_lossy(&st_out.stdout);
+                    if let Ok(statuses) = serde_json::from_str::<Vec<serde_json::Value>>(&st_text) {
+                        if let Some(s) = statuses.first() {
+                            let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                            let url = s.get("environment_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            results.push((env, state, url));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        results.push((env, "unknown".to_string(), String::new()));
+    }
+    results
+}
+
 /// Find directories containing `.git` up to max_depth (public wrapper)
 pub fn find_git_repos_pub(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     find_git_repos(root, max_depth)

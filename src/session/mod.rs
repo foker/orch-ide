@@ -91,12 +91,20 @@ pub struct ProjectGroup {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct DeploymentInfo {
+    pub env: String,
+    pub state: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SubRepoView {
     pub name: String,
     pub branch: String,
     pub dirty_files: u32,
     pub has_unmerged_pr: bool,
-    pub pr_number: String, // e.g. "#466" or ""
+    pub pr_number: String,
+    pub deployments: Vec<DeploymentInfo>,
 }
 
 impl ProjectGroup {

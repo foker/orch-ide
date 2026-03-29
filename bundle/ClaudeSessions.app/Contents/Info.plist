@@ -24,5 +24,7 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Claude Sessions needs microphone access for voice-to-text input</string>
 </dict>
 </plist>

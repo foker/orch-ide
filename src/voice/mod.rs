@@ -27,22 +27,35 @@ impl AudioRecorder {
         let device = host.default_input_device()
             .ok_or("No input device found")?;
 
+        // Use device's default config instead of hardcoding
+        let default_config = device.default_input_config()
+            .map_err(|e| format!("No default input config: {}", e))?;
+
         let config = cpal::StreamConfig {
-            channels: 1,
-            sample_rate: cpal::SampleRate(16000),
+            channels: default_config.channels(),
+            sample_rate: default_config.sample_rate(),
             buffer_size: cpal::BufferSize::Default,
         };
 
-        self.sample_rate = 16000;
-        self.channels = 1;
+        self.sample_rate = config.sample_rate.0;
+        self.channels = config.channels;
         self.samples.lock().unwrap().clear();
 
         let samples = self.samples.clone();
+        let channels = config.channels as usize;
 
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                samples.lock().unwrap().extend_from_slice(data);
+                // Downmix to mono if stereo
+                if channels > 1 {
+                    let mono: Vec<f32> = data.chunks(channels)
+                        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                        .collect();
+                    samples.lock().unwrap().extend_from_slice(&mono);
+                } else {
+                    samples.lock().unwrap().extend_from_slice(data);
+                }
             },
             |err| {
                 eprintln!("[VOICE] Stream error: {}", err);
@@ -61,7 +74,20 @@ impl AudioRecorder {
         self.is_recording = false;
 
         let samples = self.samples.lock().unwrap();
-        encode_wav(&samples, self.sample_rate, self.channels)
+        let duration = samples.len() as f32 / self.sample_rate as f32;
+        let max_amp: f32 = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+
+        // Encode WAV — always mono
+        let wav = encode_wav(&samples, self.sample_rate, 1);
+
+        // Debug: save to disk and log stats
+        let _ = std::fs::write("/tmp/claude-voice-debug.wav", &wav);
+        crate::logging::log(&format!(
+            "Voice stop: {} samples, rate={}, dur={:.1}s, max_amp={:.4}, wav={}b",
+            samples.len(), self.sample_rate, duration, max_amp, wav.len()
+        ));
+
+        wav
     }
 
     /// Check if there's sound activity (RMS > threshold)

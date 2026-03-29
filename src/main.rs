@@ -4,6 +4,7 @@ mod git_info;
 mod hooks;
 mod persistence;
 mod logging;
+mod voice;
 
 use iced::widget::{
     button, column, container, row, scrollable, text,
@@ -154,6 +155,9 @@ enum Message {
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
     RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
     OpenFile(PathBuf),
+    // Voice
+    VoiceToggle, VoiceResult(Result<String, String>),
+    GroqKeyChanged(String),
     ResizeSidebar(f32),
     ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
     KeyboardEvent(iced::keyboard::Event),
@@ -178,8 +182,12 @@ struct App {
     launch_claude: bool,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
-    renaming_session: Option<(usize, usize)>, // (pi, si)
+    renaming_session: Option<(usize, usize)>,
     rename_input: String,
+    // Voice
+    voice_recorder: voice::AudioRecorder,
+    groq_api_key: String,
+    voice_transcribing: bool,
     current_theme: AppTheme,
     sidebar_width: f32,
     tick_count: u32,
@@ -194,6 +202,7 @@ impl Default for App {
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
             launch_claude: true,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(),
+            voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
     }
@@ -221,6 +230,7 @@ impl App {
                 _ => AppTheme::Midnight,
             };
             app.sidebar_width = state.sidebar_width;
+            app.groq_api_key = state.groq_api_key;
             // Refresh git info
             for p in &mut app.projects {
                 if let Some(info) = git_info::get_git_info_with_pr(&p.path) {
@@ -234,7 +244,7 @@ impl App {
     fn tc(&self) -> TC { self.current_theme.colors() }
 
     fn spawn_session_terminal(&mut self, pi: usize, si: usize, resume: bool) {
-        app_log!("spawn_terminal: pi={} si={} resume={}", pi, si, resume);
+        app_log!("spawn_terminal: pi={} si={} resume={} (active terminals: {})", pi, si, resume, self.terminals.len());
         let cwd = self.projects[pi].path.clone();
         let session_name = self.projects[pi].sessions[si].name.clone();
         let tid = self.next_term_id;
@@ -295,6 +305,7 @@ impl App {
             projects: self.projects.clone(),
             theme: format!("{:?}", self.current_theme),
             sidebar_width: self.sidebar_width,
+            groq_api_key: self.groq_api_key.clone(),
         });
     }
 
@@ -412,6 +423,10 @@ impl App {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
                     self.projects[pi].sessions[si].status = SessionStatus::Idle;
                     self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
+                    // Write idle to status.json so Tick doesn't overwrite
+                    let sid = &self.projects[pi].sessions[si].id;
+                    let status_file = hooks::status_dir().join(sid).join("status.json");
+                    let _ = std::fs::write(&status_file, r#"{"status":"idle"}"#);
                 }
                 Task::none()
             }
@@ -525,6 +540,55 @@ impl App {
             Message::OpenFile(path) => {
                 app_log!("OpenFile: {:?}", path);
                 let _ = std::process::Command::new("open").arg(&path).spawn();
+                Task::none()
+            }
+            Message::VoiceToggle => {
+                if self.voice_recorder.is_recording {
+                    // Stop recording and transcribe
+                    let wav = self.voice_recorder.stop();
+                    app_log!("Voice: stopped, {} bytes WAV", wav.len());
+                    if self.groq_api_key.is_empty() {
+                        app_log!("Voice: no Groq API key set!");
+                        return Task::none();
+                    }
+                    self.voice_transcribing = true;
+                    let key = self.groq_api_key.clone();
+                    Task::perform(
+                        async move { voice::transcribe_groq(wav, &key).await },
+                        Message::VoiceResult,
+                    )
+                } else {
+                    // Start recording
+                    match self.voice_recorder.start() {
+                        Ok(()) => app_log!("Voice: recording started"),
+                        Err(e) => app_log!("Voice: failed to start: {}", e),
+                    }
+                    Task::none()
+                }
+            }
+            Message::VoiceResult(result) => {
+                self.voice_transcribing = false;
+                match result {
+                    Ok(text) => {
+                        app_log!("Voice: transcribed: {}", text);
+                        // Write text to active terminal
+                        if let Some((pi, si)) = self.active_session {
+                            if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                                ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                                    iced_term::backend::Command::Write(text.into_bytes())
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app_log!("Voice: transcription error: {}", e);
+                    }
+                }
+                Task::none()
+            }
+            Message::GroqKeyChanged(key) => {
+                self.groq_api_key = key;
+                self.save_state();
                 Task::none()
             }
             Message::CancelDelete => { self.confirm_delete = None; Task::none() }
@@ -941,7 +1005,37 @@ impl App {
             container(text("No terminal").size(13).color(tc.text_muted)).center(Fill).height(Fill).into()
         };
 
-        column![info_bar, rule::horizontal(1), terminal_view].into()
+        // Voice button bar at bottom
+        let voice_icon = if self.voice_transcribing {
+            "⏳"
+        } else if self.voice_recorder.is_recording {
+            if self.blink_on { "⏺" } else { "🎙" }
+        } else {
+            "🎙"
+        };
+        let voice_color = if self.voice_recorder.is_recording { tc.red } else { tc.text_muted };
+        let voice_label = if self.voice_transcribing {
+            "Transcribing..."
+        } else if self.voice_recorder.is_recording {
+            "Recording... click to stop"
+        } else {
+            ""
+        };
+
+        let voice_bar = container(
+            row![
+                Space::new().width(Fill),
+                tip(
+                    button(text(voice_icon).size(16).color(voice_color))
+                        .on_press(Message::VoiceToggle)
+                        .style(button::text).padding([4, 8]),
+                    "Voice input (Groq Whisper)"
+                ),
+                text(voice_label).size(10).color(tc.text_muted),
+            ].spacing(6).padding([2, 8]).align_y(iced::Alignment::Center),
+        );
+
+        column![info_bar, rule::horizontal(1), terminal_view, voice_bar].into()
     }
 
     fn view_explorer(&self) -> Element<'_, Message> {
@@ -1022,11 +1116,22 @@ impl App {
             );
         }
 
+        // Groq API key section
+        let groq_section = column![
+            text("Voice Input (Groq Whisper)").size(12).color(tc.text_muted),
+            text_input("Groq API key...", &self.groq_api_key)
+                .on_input(Message::GroqKeyChanged)
+                .size(12).padding(6),
+            text("Get key at console.groq.com").size(10).color(tc.text_muted),
+        ].spacing(4);
+
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
                 text("Color Theme").size(12).color(tc.text_muted),
                 themes,
+                Space::new().height(20),
+                groq_section,
             ].spacing(8).padding([16, 20])).height(Fill),
         ]).center_x(Fill).height(Fill).into()
     }

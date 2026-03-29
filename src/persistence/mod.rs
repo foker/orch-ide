@@ -8,6 +8,8 @@ pub struct AppState {
     pub theme: String,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    #[serde(default)]
+    pub groq_api_key: String,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }

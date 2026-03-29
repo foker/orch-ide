@@ -613,8 +613,18 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
             shell.publish(Event::BackendCall(self.term.id, cmd));
         }
 
+        // Allow mouse clicks to refocus terminal even when unfocused
         if !state.is_focused {
-            return;
+            if let iced::Event::Mouse(iced::mouse::Event::ButtonPressed(_)) = event {
+                if self.is_cursor_in_layout(cursor, layout) {
+                    state.is_focused = true;
+                    // fall through to handle the click
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
 
         let commands = match event {
@@ -624,16 +634,16 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 self.handle_mouse_event(
                     state,
                     layout.position(),
-                    cursor.position().unwrap(), // Assuming cursor position is always available here.
+                    cursor.position().unwrap(),
                     mouse_event,
                 )
             },
             iced::Event::Keyboard(keyboard_event) => {
                 self.handle_keyboard_event(state, clipboard, keyboard_event)
-                    .into_iter() // Convert Option to iterator (0 or 1 element)
+                    .into_iter()
                     .collect()
             },
-            _ => Vec::new(), // No commands for other events.
+            _ => Vec::new(),
         };
 
         for cmd in commands {

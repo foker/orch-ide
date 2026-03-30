@@ -263,17 +263,18 @@ impl Backend {
             let start = range.start();
             let end = range.end();
 
-            let mut url = String::from(self.last_content.grid.index(*start).c);
+            let mut url = String::new();
             for indexed in self.last_content.grid.iter_from(*start) {
                 url.push(indexed.c);
                 if indexed.point == *end {
                     break;
                 }
             }
+            let url = url.trim().to_string();
 
-            open::that(url).unwrap_or_else(|_| {
-                panic!("link opening is failed");
-            })
+            if let Err(e) = open::that(&url) {
+                eprintln!("[iced_term] Failed to open link '{}': {}", url, e);
+            }
         }
     }
 

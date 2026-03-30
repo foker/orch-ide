@@ -271,8 +271,15 @@ impl Backend {
                 }
             }
             let url = url.trim().to_string();
+            eprintln!("[iced_term] Opening link: '{}'", url);
 
-            if let Err(e) = open::that(&url) {
+            if url.is_empty() {
+                eprintln!("[iced_term] Empty URL, skipping");
+                return;
+            }
+
+            // Use macOS `open` command directly for reliability
+            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
                 eprintln!("[iced_term] Failed to open link '{}': {}", url, e);
             }
         }

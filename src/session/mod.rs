@@ -30,6 +30,35 @@ pub struct SessionProgress {
     pub etc: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionColor {
+    Grey, Red, Orange, Yellow, Green, Blue, Purple, Pink,
+}
+
+impl Default for SessionColor {
+    fn default() -> Self { SessionColor::Grey }
+}
+
+impl SessionColor {
+    pub fn all() -> &'static [SessionColor] {
+        &[SessionColor::Grey, SessionColor::Red, SessionColor::Orange, SessionColor::Yellow,
+          SessionColor::Green, SessionColor::Blue, SessionColor::Purple, SessionColor::Pink]
+    }
+
+    pub fn to_rgb(&self) -> (u8, u8, u8) {
+        match self {
+            SessionColor::Grey => (0x88, 0x88, 0x99),
+            SessionColor::Red => (0xf0, 0x50, 0x50),
+            SessionColor::Orange => (0xf0, 0x80, 0x40),
+            SessionColor::Yellow => (0xf0, 0xc0, 0x50),
+            SessionColor::Green => (0x3d, 0xd6, 0x8c),
+            SessionColor::Blue => (0x50, 0x90, 0xf0),
+            SessionColor::Purple => (0x90, 0x70, 0xf0),
+            SessionColor::Pink => (0xf0, 0x70, 0xc0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -40,6 +69,8 @@ pub struct Session {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(default = "chrono::Utc::now")]
     pub status_changed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub color: SessionColor,
 }
 
 impl Session {
@@ -53,6 +84,7 @@ impl Session {
             background_agents: 0,
             created_at: now,
             status_changed_at: now,
+            color: SessionColor::Grey,
         }
     }
 

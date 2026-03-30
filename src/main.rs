@@ -153,6 +153,8 @@ enum Message {
     ToggleLaunchClaude,
     SelectSession(usize, usize), KillSession(usize, usize), MakeIdle(usize, usize),
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
+    SetSessionColor(usize, usize, session::SessionColor),
+    SetNewSessionColor(session::SessionColor),
     RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
     OpenFile(PathBuf),
     // Async git info
@@ -192,6 +194,7 @@ struct App {
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
     rename_input: String,
+    new_session_color: session::SessionColor,
     // Deployments
     show_deployment_dropdown: bool,
     // Voice
@@ -211,7 +214,7 @@ impl Default for App {
             file_entries: Vec::new(), terminals: Vec::new(), next_term_id: 0,
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
             launch_claude: true,
-            show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(),
+            show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
@@ -388,7 +391,8 @@ impl App {
                                 }
                                 self.projects.push(group);
                                 let new_pi = self.projects.len() - 1;
-                                let session = Session::new(name);
+                                let mut session = Session::new(name);
+                                session.color = self.new_session_color;
                                 self.projects[new_pi].sessions.push(session);
                                 self.active_project = Some(new_pi);
                                 self.active_session = Some((new_pi, 0));
@@ -399,7 +403,8 @@ impl App {
                         }
                     } else if pi < self.projects.len() {
                         // Normal "add session" flow
-                        let session = Session::new(name);
+                        let mut session = Session::new(name);
+                        session.color = self.new_session_color;
                         self.projects[pi].sessions.push(session);
                         let si = self.projects[pi].sessions.len() - 1;
                         self.active_session = Some((pi, si));
@@ -535,6 +540,17 @@ impl App {
                 iced::widget::operation::focus_next()
             }
             Message::RenameSessionInput(s) => { self.rename_input = s; Task::none() }
+            Message::SetSessionColor(pi, si, color) => {
+                if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
+                    self.projects[pi].sessions[si].color = color;
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::SetNewSessionColor(color) => {
+                self.new_session_color = color;
+                Task::none()
+            }
             Message::RenameSessionSubmit => {
                 if let Some((pi, si)) = self.renaming_session {
                     if pi < self.projects.len() && si < self.projects[pi].sessions.len() && !self.rename_input.is_empty() {
@@ -844,6 +860,20 @@ impl App {
                         text("Launch Claude").size(11).color(tc.text_secondary),
                     ].spacing(6).align_y(iced::Alignment::Center)
                 ).on_press(Message::ToggleLaunchClaude).style(button::text).padding([2, 0]),
+                {
+                    let mut color_row = Row::new().spacing(4);
+                    for &clr in session::SessionColor::all() {
+                        let (r, g, b) = clr.to_rgb();
+                        let is_sel = self.new_session_color == clr;
+                        let dot_size = if is_sel { 12 } else { 10 };
+                        color_row = color_row.push(
+                            button(text("●").size(dot_size).color(c(r, g, b)))
+                                .on_press(Message::SetNewSessionColor(clr))
+                                .style(button::text).padding([1, 2])
+                        );
+                    }
+                    color_row
+                },
             ].spacing(4)).padding(8).style({let t = tc.clone(); move |_: &Theme| styled_card(&t)}));
         }
 
@@ -887,12 +917,16 @@ impl App {
                             .on_submit(Message::RenameSessionSubmit)
                             .size(13).padding(2).width(Fill)
                     );
+                    // Color picker row when renaming
+                    // (will be added after meta below)
                 } else {
+                    // Pencil icon (visible on card hover via parent button hover state)
                     top = top.push(
-                        button(text(&session.name).size(13).color(tc.text_primary))
+                        button(text("✏").size(10).color(Color { a: 0.4, ..tc.text_muted }))
                             .on_press(Message::StartRenameSession(pi, si))
-                            .style(button::text).padding(0)
+                            .style(button::text).padding([0, 2])
                     );
+                    top = top.push(text(&session.name).size(13).color(tc.text_primary));
                 }
                 if session.background_agents > 0 {
                     top = top.push(text(format!("🤖{}", session.background_agents)).size(10).color(tc.green));
@@ -936,13 +970,37 @@ impl App {
                     r.into()
                 };
 
-                let border_c = if is_active { t.border_active } else { t.border };
+                let (cr, cg, cb) = session.color.to_rgb();
+                let session_border_color = c(cr, cg, cb);
+                let border_c = if is_active { session_border_color } else {
+                    Color { a: 0.4, ..session_border_color }
+                };
                 let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
                 let hover_bg = t.bg_card_hover;
 
                 // Card row: [card button] [kill button]
                 let card_row = row![
-                    button(column![top, meta].spacing(6))
+                    button({
+                        let mut card_col = Column::new().spacing(6);
+                        card_col = card_col.push(top);
+                        card_col = card_col.push(meta);
+                        // Color picker when renaming
+                        if self.renaming_session == Some((pi, si)) {
+                            let mut color_row = Row::new().spacing(4);
+                            for &clr in session::SessionColor::all() {
+                                let (r, g, b) = clr.to_rgb();
+                                let is_selected = session.color == clr;
+                                let dot_size = if is_selected { 12 } else { 10 };
+                                color_row = color_row.push(
+                                    button(text("●").size(dot_size).color(c(r, g, b)))
+                                        .on_press(Message::SetSessionColor(pi, si, clr))
+                                        .style(button::text).padding([1, 2])
+                                );
+                            }
+                            card_col = card_col.push(color_row);
+                        }
+                        card_col
+                    })
                         .on_press(Message::SelectSession(pi, si))
                         .style(move |_: &Theme, status: button::Status| {
                             let bg = match status {

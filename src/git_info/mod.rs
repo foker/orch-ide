@@ -17,6 +17,7 @@ pub struct SubRepo {
     pub pr: PrStatus,
 }
 
+#[derive(Debug, Clone)]
 pub struct GitInfo {
     pub branch: String,     // main repo branch (or first found)
     pub dirty_files: u32,   // total across all repos

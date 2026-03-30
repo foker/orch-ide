@@ -155,6 +155,9 @@ enum Message {
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
     RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
     OpenFile(PathBuf),
+    // Async git info
+    FetchGitInfo(usize),
+    GitInfoFetched(usize, Option<git_info::GitInfo>),
     // Deployments
     FetchDeployments(usize), // project index
     DeploymentsFetched(usize, Vec<(String, Vec<(String, String, String)>)>), // pi, vec of (sub_repo_name, deployments)
@@ -239,13 +242,7 @@ impl App {
             };
             app.sidebar_width = state.sidebar_width;
             app.groq_api_key = state.groq_api_key;
-            // Refresh git info
-            for p in &mut app.projects {
-                if let Some(info) = git_info::get_git_info_with_pr(&p.path) {
-                    p.branch = info.branch.clone(); p.dirty_files = info.dirty_files;
-                    p.sub_repos = to_sub_repo_views(&info);
-                }
-            }
+            // Git info loaded lazily on SelectSession (no blocking boot)
         }
         (app, Task::none())
     }
@@ -426,8 +423,10 @@ impl App {
                 if !has_term && pi < self.projects.len() && si < self.projects[pi].sessions.len() {
                     self.spawn_session_terminal(pi, si, true);
                 }
-                // Fetch deployments async
-                return self.update(Message::FetchDeployments(pi));
+                // Fetch git info + deployments async (non-blocking)
+                let git_task = self.update(Message::FetchGitInfo(pi));
+                let dep_task = self.update(Message::FetchDeployments(pi));
+                return Task::batch([git_task, dep_task]);
             }
             Message::MakeIdle(pi, si) => {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
@@ -545,6 +544,31 @@ impl App {
                 }
                 self.renaming_session = None;
                 self.rename_input.clear();
+                Task::none()
+            }
+            Message::FetchGitInfo(pi) => {
+                if pi >= self.projects.len() { return Task::none(); }
+                let path = self.projects[pi].path.clone();
+                Task::perform(
+                    async move { git_info::get_git_info(&path) },
+                    move |info| Message::GitInfoFetched(pi, info),
+                )
+            }
+            Message::GitInfoFetched(pi, info) => {
+                if let Some(info) = info {
+                    if pi < self.projects.len() {
+                        self.projects[pi].branch = info.branch.clone();
+                        self.projects[pi].dirty_files = info.dirty_files;
+                        let old_deps: std::collections::HashMap<String, Vec<session::DeploymentInfo>> = self.projects[pi].sub_repos.iter()
+                            .map(|sr| (sr.name.clone(), sr.deployments.clone())).collect();
+                        self.projects[pi].sub_repos = to_sub_repo_views(&info);
+                        for sr in &mut self.projects[pi].sub_repos {
+                            if let Some(deps) = old_deps.get(&sr.name) {
+                                sr.deployments = deps.clone();
+                            }
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::FetchDeployments(pi) => {

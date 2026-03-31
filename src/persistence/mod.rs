@@ -10,9 +10,12 @@ pub struct AppState {
     pub sidebar_width: f32,
     #[serde(default)]
     pub groq_api_key: String,
+    #[serde(default = "default_true")]
+    pub dangerously_skip_permissions: bool,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }
+fn default_true() -> bool { true }
 
 fn config_path() -> PathBuf {
     let dir = dirs::home_dir()

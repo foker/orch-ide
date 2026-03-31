@@ -168,6 +168,7 @@ enum Message {
     // Voice
     VoiceToggle, VoiceResult(Result<String, String>),
     GroqKeyChanged(String),
+    ToggleDangerouslySkipPermissions,
     ResizeSidebar(f32),
     ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
     KeyboardEvent(iced::keyboard::Event),
@@ -197,6 +198,7 @@ struct App {
     new_session_color: session::SessionColor,
     // Deployments
     show_deployment_dropdown: bool,
+    dangerously_skip_permissions: bool,
     // Voice
     voice_recorder: voice::AudioRecorder,
     groq_api_key: String,
@@ -216,6 +218,7 @@ impl Default for App {
             launch_claude: true,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
+            dangerously_skip_permissions: true,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
@@ -245,6 +248,7 @@ impl App {
             };
             app.sidebar_width = state.sidebar_width;
             app.groq_api_key = state.groq_api_key;
+            app.dangerously_skip_permissions = state.dangerously_skip_permissions;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         (app, Task::none())
@@ -259,17 +263,19 @@ impl App {
         self.next_term_id += 1;
 
         // Determine program and args
+        let skip_flag = if self.dangerously_skip_permissions { " --dangerously-skip-permissions" } else { "" };
         let (program, args) = if self.launch_claude {
             let claude_path = which_claude();
             if resume {
-                // Try --continue, fallback to --name if no conversation found
                 let cmd = format!(
-                    "{} --continue --dangerously-skip-permissions 2>/dev/null || {} --name '{}' --dangerously-skip-permissions",
-                    claude_path, claude_path, session_name.replace('\'', "'\\''")
+                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
+                    claude_path, skip_flag, claude_path, session_name.replace('\'', "'\\''"), skip_flag
                 );
                 ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
             } else {
-                (claude_path, vec!["--name".to_string(), session_name, "--dangerously-skip-permissions".to_string()])
+                let mut a = vec!["--name".to_string(), session_name];
+                if self.dangerously_skip_permissions { a.push("--dangerously-skip-permissions".to_string()); }
+                (claude_path, a)
             }
         } else {
             (std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()), vec![])
@@ -314,6 +320,7 @@ impl App {
             theme: format!("{:?}", self.current_theme),
             sidebar_width: self.sidebar_width,
             groq_api_key: self.groq_api_key.clone(),
+            dangerously_skip_permissions: self.dangerously_skip_permissions,
         });
     }
 
@@ -686,6 +693,11 @@ impl App {
                         app_log!("Voice: transcription error: {}", e);
                     }
                 }
+                Task::none()
+            }
+            Message::ToggleDangerouslySkipPermissions => {
+                self.dangerously_skip_permissions = !self.dangerously_skip_permissions;
+                self.save_state();
                 Task::none()
             }
             Message::GroqKeyChanged(key) => {
@@ -1341,6 +1353,18 @@ impl App {
 
         // Groq API key section
         let groq_section = column![
+            // Claude permissions
+            {
+                let check = if self.dangerously_skip_permissions { "☑" } else { "☐" };
+                let check_color = if self.dangerously_skip_permissions { tc.green } else { tc.text_muted };
+                button(row![
+                    text(check).size(14).color(check_color),
+                    text("Launch with --dangerously-skip-permissions").size(11).color(tc.text_secondary),
+                ].spacing(6).align_y(iced::Alignment::Center))
+                .on_press(Message::ToggleDangerouslySkipPermissions)
+                .style(button::text).padding([4, 0])
+            },
+            Space::new().height(12),
             text("Voice Input (Groq Whisper)").size(12).color(tc.text_muted),
             text_input("Groq API key...", &self.groq_api_key)
                 .on_input(Message::GroqKeyChanged)

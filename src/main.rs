@@ -17,6 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
+const APP_VERSION: &str = "0.1.1";
 
 fn main() -> iced::Result {
     logging::init();
@@ -169,6 +170,8 @@ enum Message {
     VoiceToggle, VoiceResult(Result<String, String>),
     GroqKeyChanged(String),
     ToggleDangerouslySkipPermissions,
+    UpdateCheckResult(Option<String>), // Some("0.2.0") if newer version available
+    DismissUpdate,
     ResizeSidebar(f32),
     ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
     KeyboardEvent(iced::keyboard::Event),
@@ -199,6 +202,7 @@ struct App {
     // Deployments
     show_deployment_dropdown: bool,
     dangerously_skip_permissions: bool,
+    update_available: Option<String>, // version string if update available
     // Voice
     voice_recorder: voice::AudioRecorder,
     groq_api_key: String,
@@ -218,7 +222,7 @@ impl Default for App {
             launch_claude: true,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
-            dangerously_skip_permissions: true,
+            dangerously_skip_permissions: true, update_available: None,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
@@ -251,7 +255,16 @@ impl App {
             app.dangerously_skip_permissions = state.dangerously_skip_permissions;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
-        (app, Task::none())
+        // Show settings if no projects yet
+        if app.projects.is_empty() {
+            app.show_settings = true;
+        }
+        // Check for updates async
+        let check_update = Task::perform(
+            async { check_latest_version().await },
+            Message::UpdateCheckResult,
+        );
+        (app, check_update)
     }
     fn tc(&self) -> TC { self.current_theme.colors() }
 
@@ -700,6 +713,17 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            Message::UpdateCheckResult(version) => {
+                if let Some(v) = version {
+                    app_log!("Update available: {}", v);
+                    self.update_available = Some(v);
+                }
+                Task::none()
+            }
+            Message::DismissUpdate => {
+                self.update_available = None;
+                Task::none()
+            }
             Message::GroqKeyChanged(key) => {
                 self.groq_api_key = key;
                 self.save_state();
@@ -825,8 +849,15 @@ impl App {
             row![
                 text(format!("● {} sessions", self.projects.iter().map(|p| p.sessions.len()).sum::<usize>()))
                     .size(11).color(tc.text_muted),
+                if let Some(ref ver) = self.update_available {
+                    button(text(format!("⬆ v{} available", ver)).size(10).color(tc.blue))
+                        .on_press(Message::OpenUrl("https://github.com/foker/orch-ide/releases".to_string()))
+                        .style(button::text).padding([2, 6])
+                } else {
+                    button(text("").size(1)).style(button::text).padding(0)
+                },
                 Space::new().width(Fill),
-                text("Claude Sessions v0.1.0").size(11).color(tc.text_muted),
+                text(format!("OrchIDE v{}", APP_VERSION)).size(11).color(tc.text_muted),
             ].padding(4).spacing(12),
         ).style(move |_: &Theme| styled_panel(&tc4));
 
@@ -1513,6 +1544,24 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: &str) -> Element<'a, 
             }),
         iced::widget::tooltip::Position::Bottom,
     ).into()
+}
+
+/// Check GitHub releases for newer version
+async fn check_latest_version() -> Option<String> {
+    let output = tokio::process::Command::new("gh")
+        .args(["api", "repos/foker/orch-ide/releases/latest", "--jq", ".tag_name"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() { return None; }
+    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let latest = tag.trim_start_matches('v');
+    if latest != APP_VERSION && latest > APP_VERSION {
+        Some(latest.to_string())
+    } else {
+        None
+    }
 }
 
 fn chip<'a>(label: &str, color: Color) -> Element<'a, Message> {

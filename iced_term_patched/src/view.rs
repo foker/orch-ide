@@ -196,13 +196,11 @@ impl<'a> TerminalView<'a> {
             commands.push(cmd);
         }
 
-        // Handle link hover if applicable
-        if state.keyboard_modifiers == Modifiers::COMMAND {
-            commands.push(Command::ProcessLink(
-                LinkAction::Hover,
-                state.mouse_position_on_grid,
-            ));
-        }
+        // Always check link hover (shows underline on hoverable links)
+        commands.push(Command::ProcessLink(
+            LinkAction::Hover,
+            state.mouse_position_on_grid,
+        ));
     }
 
     fn handle_button_released(
@@ -222,6 +220,7 @@ impl<'a> TerminalView<'a> {
             ));
         }
 
+        // Open link on Cmd+Click or any click when Cmd is held
         if bindings.get_action(
             InputKind::Mouse(iced_core::mouse::Button::Left),
             state.keyboard_modifiers,

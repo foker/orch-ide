@@ -1191,11 +1191,20 @@ impl App {
         let mut info_chips = Row::new().spacing(8).align_y(iced::Alignment::Center);
         info_chips = info_chips.push(chip(status_text, sc));
         info_chips = info_chips.push(chip(&format!("⎇ {}", project.branch), tc.purple));
-        // PR link in info bar
-        if let Some(sr) = project.sub_repos.first() {
+        // PR links in info bar (all sub-repos)
+        for sr in &project.sub_repos {
             if !sr.pr_number.is_empty() {
                 let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-                info_chips = info_chips.push(chip(&sr.pr_number, pr_color));
+                if !sr.pr_url.is_empty() {
+                    let url = sr.pr_url.clone();
+                    info_chips = info_chips.push(
+                        button(text(&sr.pr_number).size(11).font(MONO_FONT).color(pr_color))
+                            .on_press(Message::OpenUrl(url))
+                            .style(button::text).padding([2, 6])
+                    );
+                } else {
+                    info_chips = info_chips.push(chip(&sr.pr_number, pr_color));
+                }
             }
         }
         if project.dirty_files > 0 {
@@ -1581,12 +1590,19 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
             git_info::PrStatus::Merged(n) => (false, n.clone()),
             git_info::PrStatus::None => (false, String::new()),
         };
+        let pr_url = if !pr_num.is_empty() && !r.repo_url.is_empty() {
+            let num = pr_num.trim_start_matches('#');
+            format!("{}/pull/{}", r.repo_url, num)
+        } else {
+            String::new()
+        };
         session::SubRepoView {
             name: r.name.clone(),
             branch: r.branch.clone(),
             dirty_files: r.dirty_files,
             has_unmerged_pr: has_unmerged,
             pr_number: pr_num,
+            pr_url,
             deployments: Vec::new(),
         }
     }).collect()

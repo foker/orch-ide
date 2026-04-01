@@ -15,6 +15,7 @@ pub struct SubRepo {
     pub branch: String,
     pub dirty_files: u32,
     pub pr: PrStatus,
+    pub repo_url: String, // e.g. "https://github.com/org/repo"
 }
 
 #[derive(Debug, Clone)]
@@ -90,11 +91,22 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             PrStatus::None
         };
 
+        // Get repo URL for PR links
+        let repo_url = Command::new("gh")
+            .args(["repo", "view", "--json", "url", "-q", ".url"])
+            .current_dir(git_dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
         sub_repos.push(SubRepo {
             name,
             branch: branch.clone(),
             dirty_files: dirty,
             pr,
+            repo_url,
         });
     }
 

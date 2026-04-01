@@ -170,6 +170,9 @@ enum Message {
     VoiceToggle, VoiceResult(Result<String, String>),
     GroqKeyChanged(String),
     ToggleDangerouslySkipPermissions,
+    // Quick prompts
+    SendQuickPrompt(String),
+    AddQuickPrompt, RemoveQuickPrompt(usize), QuickPromptInput(String),
     UpdateCheckResult(Option<String>), // Some("0.2.0") if newer version available
     DismissUpdate,
     ResizeSidebar(f32),
@@ -202,7 +205,9 @@ struct App {
     // Deployments
     show_deployment_dropdown: bool,
     dangerously_skip_permissions: bool,
-    update_available: Option<String>, // version string if update available
+    quick_prompts: Vec<String>,
+    quick_prompt_input: String,
+    update_available: Option<String>,
     // Voice
     voice_recorder: voice::AudioRecorder,
     groq_api_key: String,
@@ -222,7 +227,7 @@ impl Default for App {
             launch_claude: true,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
-            dangerously_skip_permissions: true, update_available: None,
+            dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
         }
@@ -253,6 +258,7 @@ impl App {
             app.sidebar_width = state.sidebar_width;
             app.groq_api_key = state.groq_api_key;
             app.dangerously_skip_permissions = state.dangerously_skip_permissions;
+            app.quick_prompts = state.quick_prompts;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -334,6 +340,7 @@ impl App {
             sidebar_width: self.sidebar_width,
             groq_api_key: self.groq_api_key.clone(),
             dangerously_skip_permissions: self.dangerously_skip_permissions,
+            quick_prompts: self.quick_prompts.clone(),
         });
     }
 
@@ -586,7 +593,7 @@ impl App {
                 if pi >= self.projects.len() { return Task::none(); }
                 let path = self.projects[pi].path.clone();
                 Task::perform(
-                    async move { git_info::get_git_info(&path) },
+                    async move { git_info::get_git_info_with_pr(&path) },
                     move |info| Message::GitInfoFetched(pi, info),
                 )
             }
@@ -713,6 +720,34 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            Message::SendQuickPrompt(prompt) => {
+                // Type prompt into active terminal
+                if let Some((pi, si)) = self.active_session {
+                    if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                        let bytes = (prompt + "\n").into_bytes();
+                        ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                            iced_term::backend::Command::Write(bytes)
+                        ));
+                    }
+                }
+                Task::none()
+            }
+            Message::AddQuickPrompt => {
+                if !self.quick_prompt_input.is_empty() {
+                    self.quick_prompts.push(self.quick_prompt_input.clone());
+                    self.quick_prompt_input.clear();
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::RemoveQuickPrompt(idx) => {
+                if idx < self.quick_prompts.len() {
+                    self.quick_prompts.remove(idx);
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::QuickPromptInput(s) => { self.quick_prompt_input = s; Task::none() }
             Message::UpdateCheckResult(version) => {
                 if let Some(v) = version {
                     app_log!("Update available: {}", v);
@@ -1280,18 +1315,42 @@ impl App {
             ""
         };
 
-        let voice_bar = container(
-            row![
-                Space::new().width(Fill),
-                tip(
-                    button(text(voice_icon).size(16).color(voice_color))
-                        .on_press(Message::VoiceToggle)
-                        .style(button::text).padding([4, 8]),
-                    "Voice input (Groq Whisper)"
-                ),
-                text(voice_label).size(10).color(tc.text_muted),
-            ].spacing(6).padding([2, 8]).align_y(iced::Alignment::Center),
+        // Bottom bar: quick prompts (left) + voice (right)
+        let mut bottom_row = Row::new().spacing(4).padding([3, 8]).align_y(iced::Alignment::Center);
+        for prompt in &self.quick_prompts {
+            let p = prompt.clone();
+            let short = if prompt.len() > 25 { format!("{}...", &prompt[..22]) } else { prompt.clone() };
+            bottom_row = bottom_row.push(
+                button(text(short).size(9).color(tc.text_secondary))
+                    .on_press(Message::SendQuickPrompt(p))
+                    .style(move |_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered => Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+                            _ => Color::from_rgba(1.0, 1.0, 1.0, 0.03),
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            border: Border { color: Color::from_rgba(1.0, 1.0, 1.0, 0.08), width: 1.0, radius: 10.0.into(), ..Default::default() },
+                            text_color: Color::WHITE,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([3, 10])
+            );
+        }
+        bottom_row = bottom_row.push(Space::new().width(Fill));
+        bottom_row = bottom_row.push(
+            tip(
+                button(text(voice_icon).size(16).color(voice_color))
+                    .on_press(Message::VoiceToggle)
+                    .style(button::text).padding([4, 8]),
+                "Voice input"
+            )
         );
+        if !voice_label.is_empty() {
+            bottom_row = bottom_row.push(text(voice_label).size(10).color(tc.text_muted));
+        }
+        let voice_bar = container(bottom_row);
 
         let mut main_col = Column::new();
         main_col = main_col.push(info_bar);
@@ -1403,12 +1462,39 @@ impl App {
             text("Get key at console.groq.com").size(10).color(tc.text_muted),
         ].spacing(4);
 
+        // Quick prompts section
+        let mut qp_section = Column::new().spacing(4);
+        qp_section = qp_section.push(text("Quick Prompts").size(12).color(tc.text_muted));
+        for (i, prompt) in self.quick_prompts.iter().enumerate() {
+            qp_section = qp_section.push(
+                row![
+                    text(prompt.clone()).size(11).color(tc.text_secondary).width(Fill),
+                    button(text("✕").size(9).color(tc.text_muted))
+                        .on_press(Message::RemoveQuickPrompt(i))
+                        .style(button::text).padding([2, 4]),
+                ].align_y(iced::Alignment::Center)
+            );
+        }
+        qp_section = qp_section.push(
+            row![
+                text_input("New quick prompt...", &self.quick_prompt_input)
+                    .on_input(Message::QuickPromptInput)
+                    .on_submit(Message::AddQuickPrompt)
+                    .size(11).padding(4),
+                button(text("+").size(12).color(tc.text_muted))
+                    .on_press(Message::AddQuickPrompt)
+                    .style(button::text).padding([2, 6]),
+            ].spacing(4).align_y(iced::Alignment::Center)
+        );
+
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
                 text("Color Theme").size(12).color(tc.text_muted),
                 themes,
-                Space::new().height(20),
+                Space::new().height(16),
+                qp_section,
+                Space::new().height(16),
                 groq_section,
             ].spacing(8).padding([16, 20])).height(Fill),
         ]).center_x(Fill).height(Fill).into()

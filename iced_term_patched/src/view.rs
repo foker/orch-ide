@@ -221,12 +221,14 @@ impl<'a> TerminalView<'a> {
         }
 
         // Open link on Cmd+Click or any click when Cmd is held
-        if bindings.get_action(
+        let action = bindings.get_action(
             InputKind::Mouse(iced_core::mouse::Button::Left),
             state.keyboard_modifiers,
             *terminal_mode,
-        ) == BindingAction::LinkOpen
-        {
+        );
+        eprintln!("[iced_term] ButtonReleased: modifiers={:?} action={:?}", state.keyboard_modifiers, action);
+        if action == BindingAction::LinkOpen {
+            eprintln!("[iced_term] -> LinkOpen at {:?}", state.mouse_position_on_grid);
             commands.push(Command::ProcessLink(
                 LinkAction::Open,
                 state.mouse_position_on_grid,

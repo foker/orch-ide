@@ -12,6 +12,8 @@ pub struct AppState {
     pub groq_api_key: String,
     #[serde(default = "default_true")]
     pub dangerously_skip_permissions: bool,
+    #[serde(default)]
+    pub quick_prompts: Vec<String>,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }

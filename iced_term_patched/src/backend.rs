@@ -263,11 +263,15 @@ impl Backend {
             let start = range.start();
             let end = range.end();
 
+            // First char at start position
             let mut url = String::new();
-            for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
-                    break;
+            url.push(self.last_content.grid[*start].c);
+            if start != end {
+                for indexed in self.last_content.grid.iter_from(*start) {
+                    url.push(indexed.c);
+                    if indexed.point == *end {
+                        break;
+                    }
                 }
             }
             let url = url.trim().to_string();

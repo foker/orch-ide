@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.2";
+const APP_VERSION: &str = "0.1.3";
 
 fn main() -> iced::Result {
     logging::init();
@@ -590,6 +590,7 @@ impl App {
                 Task::none()
             }
             Message::FetchGitInfo(pi) => {
+                app_log!("FetchGitInfo: pi={}", pi);
                 if pi >= self.projects.len() { return Task::none(); }
                 let path = self.projects[pi].path.clone();
                 Task::perform(
@@ -598,6 +599,7 @@ impl App {
                 )
             }
             Message::GitInfoFetched(pi, info) => {
+                app_log!("GitInfoFetched: pi={} has_info={}", pi, info.is_some());
                 if let Some(info) = info {
                     if pi < self.projects.len() {
                         self.projects[pi].branch = info.branch.clone();

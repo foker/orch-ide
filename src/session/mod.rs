@@ -134,9 +134,10 @@ pub struct SubRepoView {
     pub name: String,
     pub branch: String,
     pub dirty_files: u32,
+    pub unpushed_commits: u32,
     pub has_unmerged_pr: bool,
-    pub pr_number: String,   // e.g. "#695"
-    pub pr_url: String,       // e.g. "https://github.com/org/repo/pull/695"
+    pub pr_number: String,
+    pub pr_url: String,
     pub deployments: Vec<DeploymentInfo>,
 }
 

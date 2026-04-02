@@ -14,8 +14,9 @@ pub struct SubRepo {
     pub name: String,
     pub branch: String,
     pub dirty_files: u32,
+    pub unpushed_commits: u32,
     pub pr: PrStatus,
-    pub repo_url: String, // e.g. "https://github.com/org/repo"
+    pub repo_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,16 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             PrStatus::None
         };
 
+        // Count unpushed commits
+        let unpushed = Command::new("git")
+            .args(["rev-list", "--count", "@{upstream}..HEAD"])
+            .current_dir(git_dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+            .unwrap_or(0);
+
         // Get repo URL for PR links
         let repo_url = Command::new("gh")
             .args(["repo", "view", "--json", "url", "-q", ".url"])
@@ -105,6 +116,7 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             name,
             branch: branch.clone(),
             dirty_files: dirty,
+            unpushed_commits: unpushed,
             pr,
             repo_url,
         });
@@ -167,8 +179,8 @@ fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
 /// Fetch deployments for a branch via gh API
 pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
     // (env, state, url)
-    let sha = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+    let branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(repo_path)
         .output()
         .ok()
@@ -176,9 +188,8 @@ pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
-    if sha.is_empty() { return Vec::new(); }
+    if branch.is_empty() || branch == "main" || branch == "master" { return Vec::new(); }
 
-    // Get repo name
     let repo_name = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
         .current_dir(repo_path)
@@ -190,8 +201,8 @@ pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
 
     if repo_name.is_empty() { return Vec::new(); }
 
-    // Get deployments for this SHA
-    let endpoint = format!("repos/{}/deployments?sha={}&per_page=5", repo_name, sha);
+    // Get recent deployments and match by branch name in environment/description
+    let endpoint = format!("repos/{}/deployments?per_page=30", repo_name);
     let output = Command::new("gh")
         .args(["api", &endpoint])
         .current_dir(repo_path)
@@ -203,9 +214,22 @@ pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
     let text = String::from_utf8_lossy(&out.stdout);
     let Ok(deployments) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return Vec::new(); };
 
+    // Match by exact branch name in description or ref
+    let branch_lower = branch.to_lowercase();
+
     let mut results = Vec::new();
+    let mut seen_envs = std::collections::HashSet::new();
     for d in &deployments {
         let env = d.get("environment").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let description = d.get("description").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        let ref_field = d.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Match by exact branch name in description or ref field
+        let matches = description.contains(&branch_lower) || ref_field == branch;
+
+        if !matches || seen_envs.contains(&env) { continue; }
+        seen_envs.insert(env.clone());
+
         let statuses_url = d.get("statuses_url").and_then(|v| v.as_str()).unwrap_or("");
 
         // Fetch status

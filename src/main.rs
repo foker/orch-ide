@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.3";
+const APP_VERSION: &str = "0.1.4";
 
 fn main() -> iced::Result {
     logging::init();
@@ -1190,113 +1190,100 @@ impl App {
         };
 
         let t = tc.clone();
-        let mut info_chips = Row::new().spacing(8).align_y(iced::Alignment::Center);
-        info_chips = info_chips.push(chip(status_text, sc));
-        info_chips = info_chips.push(chip(&format!("⎇ {}", project.branch), tc.purple));
-        // PR links in info bar (all sub-repos)
+
+        // Status + session name + path row
+        let mut top_row = Row::new().spacing(8).align_y(iced::Alignment::Center);
+        top_row = top_row.push(chip(status_text, sc));
+        top_row = top_row.push(
+            tip(button(text("⟳").size(10).color(tc.text_muted))
+                .on_press(Message::FetchDeployments(pi))
+                .style(button::text).padding([2, 4]),
+                "Refresh")
+        );
+        top_row = top_row.push(Space::new().width(Fill));
+        top_row = top_row.push(text(project.path.display().to_string()).size(9).font(MONO_FONT).color(tc.text_muted));
+
+        // Per-branch cards
+        let mut branch_cards = Row::new().spacing(6);
         for sr in &project.sub_repos {
+            let t2 = tc.clone();
+            let mut card_col = Column::new().spacing(2);
+
+            // Row 1: folder + branch
+            let folder_label = if sr.name == "." { "" } else { &sr.name };
+            card_col = card_col.push(
+                row![
+                    text(format!("{} ⎇ {}", folder_label, sr.branch)).size(11).font(MONO_FONT).color(tc.purple),
+                ].spacing(4)
+            );
+
+            // Row 2: stats
+            let mut stats = Row::new().spacing(4);
+            if sr.dirty_files > 0 {
+                stats = stats.push(text(format!("✎{}", sr.dirty_files)).size(11).font(MONO_FONT).color(tc.orange));
+            }
+            if sr.unpushed_commits > 0 {
+                stats = stats.push(text(format!("⬆{}", sr.unpushed_commits)).size(11).font(MONO_FONT).color(tc.yellow));
+            }
+            if sr.dirty_files == 0 && sr.unpushed_commits == 0 {
+                stats = stats.push(text("✓").size(11).color(tc.text_muted));
+            }
+            // PR
             if !sr.pr_number.is_empty() {
                 let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
                 if !sr.pr_url.is_empty() {
                     let url = sr.pr_url.clone();
-                    info_chips = info_chips.push(
+                    stats = stats.push(
                         button(text(&sr.pr_number).size(11).font(MONO_FONT).color(pr_color))
                             .on_press(Message::OpenUrl(url))
-                            .style(button::text).padding([2, 6])
+                            .style(button::text).padding(0)
                     );
                 } else {
-                    info_chips = info_chips.push(chip(&sr.pr_number, pr_color));
+                    stats = stats.push(text(&sr.pr_number).size(11).font(MONO_FONT).color(pr_color));
                 }
             }
-        }
-        if project.dirty_files > 0 {
-            info_chips = info_chips.push(chip(&format!("✎ {} uncommitted", project.dirty_files), tc.orange));
-        } else {
-            info_chips = info_chips.push(chip("✓ clean", tc.text_muted));
-        }
-        if session.background_agents > 0 {
-            info_chips = info_chips.push(chip(&format!("🤖 {} agents", session.background_agents), tc.green));
-        }
-        // Deployments
-        let all_deps: Vec<&session::DeploymentInfo> = project.sub_repos.iter()
-            .flat_map(|sr| sr.deployments.iter())
-            .collect();
-        if !all_deps.is_empty() {
-            let first = &all_deps[0];
-            let dep_icon = match first.state.as_str() {
-                "success" => "🟢",
-                "failure" | "error" => "🔴",
-                "in_progress" | "pending" => "⏳",
-                _ => "⚪",
-            };
-            if !first.url.is_empty() {
-                let url = first.url.clone();
-                // Shorten URL for display
-                let short = first.url.replace("https://", "").chars().take(35).collect::<String>();
-                info_chips = info_chips.push(
-                    button(text(format!("{} {}", dep_icon, short)).size(10).font(MONO_FONT).color(tc.blue))
-                        .on_press(Message::OpenUrl(url))
-                        .style(button::text).padding([2, 4])
-                );
-            } else {
-                info_chips = info_chips.push(text(format!("{} {}", dep_icon, first.env)).size(10).color(tc.text_muted));
-            }
-            if all_deps.len() > 1 {
-                info_chips = info_chips.push(
-                    button(text(format!("+{} more", all_deps.len() - 1)).size(10).color(tc.text_secondary))
-                        .on_press(Message::ToggleDeploymentDropdown)
-                        .style(button::text).padding([2, 4])
-                );
-            }
-        }
-        // Refresh deployments button
-        let pi_for_refresh = pi;
-        info_chips = info_chips.push(
-            tip(button(text("⟳").size(10).color(tc.text_muted))
-                .on_press(Message::FetchDeployments(pi_for_refresh))
-                .style(button::text).padding([2, 4]),
-                "Refresh deployments")
-        );
-
-        info_chips = info_chips.push(Space::new().width(Fill));
-        info_chips = info_chips.push(text(project.path.display().to_string()).size(11).font(MONO_FONT).color(tc.text_muted));
-
-        let info_bar = container(info_chips.padding([8, 16]))
-            .style(move |_: &Theme| container::Style {
-                background: Some(Background::Color(t.bg_panel)),
-                border: Border { color: t.border, width: 0.0, ..Default::default() },
-                ..Default::default()
-            });
-
-        // Deployment dropdown
-        let deployment_dropdown: Option<Element<'_, Message>> = if self.show_deployment_dropdown && !all_deps.is_empty() {
-            let mut list = Column::new().spacing(2).padding(4);
-            for dep in &all_deps {
-                let icon = match dep.state.as_str() {
+            // Deployment
+            if let Some(dep) = sr.deployments.first() {
+                let dep_icon = match dep.state.as_str() {
                     "success" => "🟢", "failure" | "error" => "🔴",
                     "in_progress" | "pending" => "⏳", _ => "⚪",
                 };
                 if !dep.url.is_empty() {
                     let url = dep.url.clone();
-                    let short_url = dep.url.replace("https://", "");
-                    list = list.push(
-                        button(text(format!("{} {} — {}", icon, dep.env, short_url)).size(10).font(MONO_FONT).color(tc.blue))
+                    let short = dep.url.replace("https://", "").chars().take(30).collect::<String>();
+                    stats = stats.push(
+                        button(text(format!("{}{}", dep_icon, short)).size(10).font(MONO_FONT).color(tc.blue))
                             .on_press(Message::OpenUrl(url))
-                            .style(button::text).padding([3, 8])
+                            .style(button::text).padding(0)
                     );
                 } else {
-                    list = list.push(text(format!("{} {}", icon, dep.env)).size(10).color(tc.text_muted));
+                    stats = stats.push(text(dep_icon).size(11));
                 }
             }
-            let t2 = tc.clone();
-            Some(container(list).style(move |_: &Theme| container::Style {
-                background: Some(Background::Color(t2.bg_card)),
-                border: Border { color: t2.border, width: 1.0, radius: 4.0.into(), ..Default::default() },
-                ..Default::default()
-            }).into())
-        } else {
-            None
-        };
+            card_col = card_col.push(stats);
+
+            branch_cards = branch_cards.push(
+                container(card_col).padding([4, 8])
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(Color { a: 0.03, ..Color::WHITE })),
+                        border: Border { color: t2.border, width: 1.0, radius: 4.0.into(), ..Default::default() },
+                        ..Default::default()
+                    })
+            );
+        }
+
+        let info_bar = container(
+            column![
+                top_row,
+                scrollable(branch_cards).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())),
+            ].spacing(4).padding([6, 12])
+        ).style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(t.bg_panel)),
+            border: Border { color: t.border, width: 0.0, ..Default::default() },
+            ..Default::default()
+        });
+
+        // Deployments now shown inline in branch cards above
 
         // Terminal widget (hide when session dialog is open to prevent keyboard conflict)
         let terminal_view: Element<'_, Message> = if self.show_session_dialog.is_some() {
@@ -1365,9 +1352,6 @@ impl App {
 
         let mut main_col = Column::new();
         main_col = main_col.push(info_bar);
-        if let Some(dropdown) = deployment_dropdown {
-            main_col = main_col.push(dropdown);
-        }
         main_col = main_col.push(rule::horizontal(1));
         main_col = main_col.push(terminal_view);
         main_col = main_col.push(voice_bar);
@@ -1602,6 +1586,7 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
             name: r.name.clone(),
             branch: r.branch.clone(),
             dirty_files: r.dirty_files,
+            unpushed_commits: r.unpushed_commits,
             has_unmerged_pr: has_unmerged,
             pr_number: pr_num,
             pr_url,
@@ -1612,7 +1597,19 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
 
 /// Find claude binary path
 fn which_claude() -> String {
-    // Try common paths first (macOS .app bundle has limited PATH)
+    // Use login shell to resolve claude path (picks up nvm, homebrew, etc.)
+    if let Ok(out) = std::process::Command::new("/bin/sh")
+        .args(["-lc", "which claude"])
+        .output()
+    {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    // Fallback to common paths
     let candidates = [
         dirs::home_dir().map(|h| h.join(".local/bin/claude").to_string_lossy().to_string()),
         dirs::home_dir().map(|h| h.join(".claude/bin/claude").to_string_lossy().to_string()),
@@ -1626,7 +1623,7 @@ fn which_claude() -> String {
             }
         }
     }
-    // Fallback to which
+    // Last resort
     std::process::Command::new("which")
         .arg("claude")
         .output()

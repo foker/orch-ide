@@ -159,6 +159,7 @@ enum Message {
     RemoveProject(usize), DeleteProjectDir(usize), ConfirmDeleteDir(usize), CancelDelete, ToggleProjectExpand(usize),
     OpenFile(PathBuf),
     // Async git info
+    RefreshProject(usize), // refresh git + PR + deployments for one project
     FetchGitInfo(usize),
     GitInfoFetched(usize, Option<git_info::GitInfo>),
     // Deployments
@@ -588,6 +589,11 @@ impl App {
                 self.renaming_session = None;
                 self.rename_input.clear();
                 Task::none()
+            }
+            Message::RefreshProject(pi) => {
+                let git_task = self.update(Message::FetchGitInfo(pi));
+                let dep_task = self.update(Message::FetchDeployments(pi));
+                return Task::batch([git_task, dep_task]);
             }
             Message::FetchGitInfo(pi) => {
                 app_log!("FetchGitInfo: pi={}", pi);
@@ -1196,9 +1202,9 @@ impl App {
         top_row = top_row.push(chip(status_text, sc));
         top_row = top_row.push(
             tip(button(text("⟳").size(10).color(tc.text_muted))
-                .on_press(Message::FetchDeployments(pi))
+                .on_press(Message::RefreshProject(pi))
                 .style(button::text).padding([2, 4]),
-                "Refresh")
+                "Refresh git & deployments")
         );
         top_row = top_row.push(Space::new().width(Fill));
         top_row = top_row.push(text(project.path.display().to_string()).size(9).font(MONO_FONT).color(tc.text_muted));

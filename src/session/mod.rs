@@ -133,6 +133,7 @@ pub struct DeploymentInfo {
 pub struct SubRepoView {
     pub name: String,
     pub branch: String,
+    pub commit_short: String,
     pub dirty_files: u32,
     pub unpushed_commits: u32,
     pub has_unmerged_pr: bool,

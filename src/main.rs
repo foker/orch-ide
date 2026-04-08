@@ -8,7 +8,7 @@ mod voice;
 
 use iced::widget::{
     button, column, container, row, scrollable, text,
-    text_input, Column, Row, Space, rule,
+    text_input, mouse_area, Column, Row, Space, rule,
 };
 use iced::{Element, Fill, Font, Padding, Subscription, Theme, Color, Border, Background, Task};
 use session::{ProjectGroup, Session, SessionStatus};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.4";
+const APP_VERSION: &str = "0.1.5";
 
 fn main() -> iced::Result {
     logging::init();
@@ -153,6 +153,7 @@ enum Message {
     AddSession(usize), SessionNameSubmit(usize, String), SessionNameChanged(String),
     ToggleLaunchClaude,
     SelectSession(usize, usize), KillSession(usize, usize), MakeIdle(usize, usize),
+    CardHover(Option<(usize, usize)>),
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
     SetSessionColor(usize, usize, session::SessionColor),
     SetNewSessionColor(session::SessionColor),
@@ -171,6 +172,7 @@ enum Message {
     VoiceToggle, VoiceResult(Result<String, String>),
     GroqKeyChanged(String),
     ToggleDangerouslySkipPermissions,
+    ToggleDatePrefix,
     // Quick prompts
     SendQuickPrompt(String),
     AddQuickPrompt, RemoveQuickPrompt(usize), QuickPromptInput(String),
@@ -215,6 +217,8 @@ struct App {
     voice_transcribing: bool,
     current_theme: AppTheme,
     sidebar_width: f32,
+    date_prefix_enabled: bool,
+    hovered_card: Option<(usize, usize)>,
     tick_count: u32,
     blink_on: bool,
 }
@@ -230,7 +234,7 @@ impl Default for App {
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
-            current_theme: AppTheme::Midnight, sidebar_width: 280.0, tick_count: 0, blink_on: true,
+            current_theme: AppTheme::Midnight, sidebar_width: 280.0, date_prefix_enabled: true, hovered_card: None, tick_count: 0, blink_on: true,
         }
     }
 }
@@ -260,6 +264,7 @@ impl App {
             app.groq_api_key = state.groq_api_key;
             app.dangerously_skip_permissions = state.dangerously_skip_permissions;
             app.quick_prompts = state.quick_prompts;
+            app.date_prefix_enabled = state.date_prefix_enabled;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -304,13 +309,15 @@ impl App {
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        // Inherit PATH from user shell
-        if let Ok(path) = std::env::var("PATH") {
-            env.insert("PATH".to_string(), path);
-        } else {
-            env.insert("PATH".to_string(), format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
-                dirs::home_dir().unwrap_or_default().display()));
-        }
+        // Get full PATH from login shell (picks up nvm, homebrew, etc.)
+        let full_path = std::process::Command::new("/bin/sh")
+            .args(["-lc", "echo $PATH"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        env.insert("PATH".to_string(), full_path);
 
         let settings = iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
@@ -342,6 +349,7 @@ impl App {
             groq_api_key: self.groq_api_key.clone(),
             dangerously_skip_permissions: self.dangerously_skip_permissions,
             quick_prompts: self.quick_prompts.clone(),
+            date_prefix_enabled: self.date_prefix_enabled,
         });
     }
 
@@ -405,8 +413,12 @@ impl App {
                     if pi == usize::MAX {
                         // "+" flow: create new folder in parent
                         if let Some(parent) = self.new_project_parent.take() {
-                            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                            let folder_name = format!("{}-{}", date, name);
+                            let folder_name = if self.date_prefix_enabled {
+                                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                format!("{}-{}", date, name)
+                            } else {
+                                name.clone()
+                            };
                             let new_path = parent.join(&folder_name);
                             app_log!("Creating new project folder: {:?}", new_path);
                             if let Err(e) = std::fs::create_dir_all(&new_path) {
@@ -445,6 +457,7 @@ impl App {
                 self.new_project_parent = None;
                 Task::none()
             }
+            Message::CardHover(v) => { self.hovered_card = v; Task::none() }
             Message::SelectSession(pi, si) => {
                 app_log!("SelectSession: pi={} si={}", pi, si);
                 self.active_session = Some((pi, si));
@@ -728,6 +741,11 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            Message::ToggleDatePrefix => {
+                self.date_prefix_enabled = !self.date_prefix_enabled;
+                self.save_state();
+                Task::none()
+            }
             Message::SendQuickPrompt(prompt) => {
                 // Type prompt into active terminal
                 if let Some((pi, si)) = self.active_session {
@@ -1006,13 +1024,18 @@ impl App {
                     // Color picker row when renaming
                     // (will be added after meta below)
                 } else {
-                    // Pencil icon (visible on card hover via parent button hover state)
-                    top = top.push(
-                        button(text("✏").size(10).color(Color { a: 0.4, ..tc.text_muted }))
-                            .on_press(Message::StartRenameSession(pi, si))
-                            .style(button::text).padding([0, 2])
-                    );
                     top = top.push(text(&session.name).size(13).color(tc.text_primary));
+                    // Pencil icon (visible on card hover)
+                    if self.hovered_card == Some((pi, si)) || is_active {
+                        top = top.push(
+                            tip(
+                                button(text("✎").size(12).color(Color { a: 0.5, ..tc.text_primary }))
+                                    .on_press(Message::StartRenameSession(pi, si))
+                                    .style(button::text).padding([0, 3]),
+                                "Change title and color"
+                            )
+                        );
+                    }
                 }
                 if session.background_agents > 0 {
                     top = top.push(text(format!("🤖{}", session.background_agents)).size(10).color(tc.green));
@@ -1028,11 +1051,19 @@ impl App {
                         } else {
                             format!("{}:⎇ {}", sr.name, sr.branch)
                         };
+                        let dir_tip = if sr.name == "." { "Root git repo".to_string() } else { format!("{} dir → git repo", sr.name) };
                         let mut r = Row::new().spacing(4);
-                        r = r.push(text(label).size(9).font(MONO_FONT).color(tc.purple));
-                        // PR dot: blue = unmerged, grey = none/merged
+                        r = r.push(tip(text(label).size(9).font(MONO_FONT).color(tc.purple), &dir_tip));
+                        // PR dot with tooltip
                         let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-                        r = r.push(text("⬤").size(6).color(pr_color));
+                        let pr_tip = if sr.has_unmerged_pr {
+                            format!("Open PR {}", sr.pr_number)
+                        } else if !sr.pr_number.is_empty() {
+                            format!("PR {} merged", sr.pr_number)
+                        } else {
+                            "No open PR".to_string()
+                        };
+                        r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
                         if sr.dirty_files > 0 {
                             r = r.push(text(format!("· {} files", sr.dirty_files)).size(9).font(MONO_FONT).color(tc.orange));
                         }
@@ -1042,16 +1073,23 @@ impl App {
                 } else {
                     let mut r = Row::new().spacing(4);
                     r = r.push(text(format!("⎇ {}", project.branch)).size(10).font(MONO_FONT).color(tc.purple));
-                    // PR dot
+                    // PR dot with tooltip
                     if let Some(sr) = project.sub_repos.first() {
                         let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-                        r = r.push(text("⬤").size(6).color(pr_color));
+                        let pr_tip = if sr.has_unmerged_pr {
+                            format!("Open PR {}", sr.pr_number)
+                        } else if !sr.pr_number.is_empty() {
+                            format!("PR {} merged", sr.pr_number)
+                        } else {
+                            "No open PR".to_string()
+                        };
+                        r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
                     }
                     r = r.push(text("·").size(10).color(tc.text_muted));
                     if project.dirty_files > 0 {
                         r = r.push(text(format!("{} files", project.dirty_files)).size(10).font(MONO_FONT).color(tc.orange));
                     } else {
-                        r = r.push(text("✓ clean").size(10).font(MONO_FONT).color(tc.text_muted));
+                        r = r.push(tip(text("✓ clean").size(10).font(MONO_FONT).color(tc.text_muted), "No uncommitted changes"));
                     }
                     r.into()
                 };
@@ -1119,8 +1157,12 @@ impl App {
                 ].align_y(iced::Alignment::Start);
 
                 content = content.push(
-                    container(card_row)
-                        .padding(Padding { top: 2.0, right: 0.0, bottom: 2.0, left: 12.0 })
+                    mouse_area(
+                        container(card_row)
+                            .padding(Padding { top: 2.0, right: 0.0, bottom: 2.0, left: 12.0 })
+                    )
+                    .on_enter(Message::CardHover(Some((pi, si))))
+                    .on_exit(Message::CardHover(None))
                 );
             }
 
@@ -1220,6 +1262,7 @@ impl App {
             card_col = card_col.push(
                 row![
                     text(format!("{} ⎇ {}", folder_label, sr.branch)).size(11).font(MONO_FONT).color(tc.purple),
+                    text(&sr.commit_short).size(9).font(MONO_FONT).color(tc.text_muted),
                 ].spacing(4)
             );
 
@@ -1281,7 +1324,7 @@ impl App {
         let info_bar = container(
             column![
                 top_row,
-                scrollable(branch_cards).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())),
+                scrollable(branch_cards).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())).height(50),
             ].spacing(4).padding([6, 12])
         ).style(move |_: &Theme| container::Style {
             background: Some(Background::Color(t.bg_panel)),
@@ -1442,8 +1485,8 @@ impl App {
             );
         }
 
-        // Groq API key section
-        let groq_section = column![
+        // Options section
+        let options_section = column![
             // Claude permissions
             {
                 let check = if self.dangerously_skip_permissions { "☑" } else { "☐" };
@@ -1453,6 +1496,17 @@ impl App {
                     text("Launch with --dangerously-skip-permissions").size(11).color(tc.text_secondary),
                 ].spacing(6).align_y(iced::Alignment::Center))
                 .on_press(Message::ToggleDangerouslySkipPermissions)
+                .style(button::text).padding([4, 0])
+            },
+            // Date prefix toggle
+            {
+                let check = if self.date_prefix_enabled { "☑" } else { "☐" };
+                let check_color = if self.date_prefix_enabled { tc.green } else { tc.text_muted };
+                button(row![
+                    text(check).size(14).color(check_color),
+                    text("Add date prefix to new project folders (YYYY-MM-DD-)").size(11).color(tc.text_secondary),
+                ].spacing(6).align_y(iced::Alignment::Center))
+                .on_press(Message::ToggleDatePrefix)
                 .style(button::text).padding([4, 0])
             },
             Space::new().height(12),
@@ -1488,6 +1542,16 @@ impl App {
             ].spacing(4).align_y(iced::Alignment::Center)
         );
 
+        // Footer
+        let footer = container(
+            column![
+                text("all changes saved automatically").size(10).color(tc.text_muted),
+                button(text("close").size(11).color(tc.blue))
+                    .on_press(Message::ToggleSettings)
+                    .style(button::text).padding(0),
+            ].spacing(2).align_x(iced::Alignment::End)
+        ).padding([8, 20]).width(Fill);
+
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
@@ -1496,8 +1560,10 @@ impl App {
                 Space::new().height(16),
                 qp_section,
                 Space::new().height(16),
-                groq_section,
+                options_section,
             ].spacing(8).padding([16, 20])).height(Fill),
+            rule::horizontal(1),
+            footer,
         ]).center_x(Fill).height(Fill).into()
     }
 
@@ -1591,6 +1657,7 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
         session::SubRepoView {
             name: r.name.clone(),
             branch: r.branch.clone(),
+            commit_short: r.commit_short.clone(),
             dirty_files: r.dirty_files,
             unpushed_commits: r.unpushed_commits,
             has_unmerged_pr: has_unmerged,

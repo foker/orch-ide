@@ -13,6 +13,7 @@ pub enum PrStatus {
 pub struct SubRepo {
     pub name: String,
     pub branch: String,
+    pub commit_short: String, // e.g. "f60bda7"
     pub dirty_files: u32,
     pub unpushed_commits: u32,
     pub pr: PrStatus,
@@ -92,6 +93,16 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             PrStatus::None
         };
 
+        // Short commit hash
+        let commit_short = Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(git_dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+
         // Count unpushed commits
         let unpushed = Command::new("git")
             .args(["rev-list", "--count", "@{upstream}..HEAD"])
@@ -115,6 +126,7 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
         sub_repos.push(SubRepo {
             name,
             branch: branch.clone(),
+            commit_short,
             dirty_files: dirty,
             unpushed_commits: unpushed,
             pr,

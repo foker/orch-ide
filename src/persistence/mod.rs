@@ -14,6 +14,8 @@ pub struct AppState {
     pub dangerously_skip_permissions: bool,
     #[serde(default)]
     pub quick_prompts: Vec<String>,
+    #[serde(default = "default_true")]
+    pub date_prefix_enabled: bool,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }

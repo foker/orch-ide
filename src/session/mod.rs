@@ -130,6 +130,12 @@ pub struct DeploymentInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct DevServerInfo {
+    pub url: String,
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SubRepoView {
     pub name: String,
     pub branch: String,
@@ -140,6 +146,7 @@ pub struct SubRepoView {
     pub pr_number: String,
     pub pr_url: String,
     pub deployments: Vec<DeploymentInfo>,
+    pub dev_servers: Vec<DevServerInfo>,
 }
 
 impl ProjectGroup {

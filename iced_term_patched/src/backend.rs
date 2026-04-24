@@ -24,6 +24,22 @@ use tokio::sync::mpsc;
 
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 
+fn log_link(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/claude-sessions-debug.log")
+    {
+        let now = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(f, "[{}] [iced_term] {}", now, msg);
+    }
+}
+
+pub(crate) fn log_view(msg: &str) {
+    log_link(msg);
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Write(Vec<u8>),
@@ -259,33 +275,36 @@ impl Backend {
     }
 
     fn open_link(&self) {
-        if let Some(range) = &self.last_content.hovered_hyperlink {
-            let start = range.start();
-            let end = range.end();
+        log_link("open_link: called");
+        let Some(range) = self.last_content.hovered_hyperlink.clone() else {
+            log_link("open_link: no hovered_hyperlink — Cmd not held when click fired, or hover regex did not match");
+            return;
+        };
+        let start = range.start();
+        let end = range.end();
 
-            // First char at start position
-            let mut url = String::new();
-            url.push(self.last_content.grid[*start].c);
-            if start != end {
-                for indexed in self.last_content.grid.iter_from(*start) {
-                    url.push(indexed.c);
-                    if indexed.point == *end {
-                        break;
-                    }
+        // First char at start position
+        let mut url = String::new();
+        url.push(self.last_content.grid[*start].c);
+        if start != end {
+            for indexed in self.last_content.grid.iter_from(*start) {
+                url.push(indexed.c);
+                if indexed.point == *end {
+                    break;
                 }
             }
-            let url = url.trim().to_string();
-            eprintln!("[iced_term] Opening link: '{}'", url);
+        }
+        let url = url.trim().to_string();
+        log_link(&format!("open_link: URL='{}'", url));
 
-            if url.is_empty() {
-                eprintln!("[iced_term] Empty URL, skipping");
-                return;
-            }
+        if url.is_empty() {
+            return;
+        }
 
-            // Use macOS `open` command directly for reliability
-            if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
-                eprintln!("[iced_term] Failed to open link '{}': {}", url, e);
-            }
+        // Use absolute path to `open` so a minimal launchd PATH can't hide /usr/bin/open
+        match std::process::Command::new("/usr/bin/open").arg(&url).spawn() {
+            Ok(_) => log_link(&format!("open_link: spawned /usr/bin/open '{}'", url)),
+            Err(e) => log_link(&format!("open_link: FAILED to spawn /usr/bin/open '{}': {}", url, e)),
         }
     }
 

@@ -226,9 +226,17 @@ impl<'a> TerminalView<'a> {
             state.keyboard_modifiers,
             *terminal_mode,
         );
-        eprintln!("[iced_term] ButtonReleased: modifiers={:?} action={:?}", state.keyboard_modifiers, action);
+        // Only log when something actually happens — otherwise every plain click writes to disk.
+        if action != BindingAction::Ignore {
+            crate::backend::log_view(&format!(
+                "ButtonReleased: mods={:?} action={:?} mouse_mode_active={} at {:?}",
+                state.keyboard_modifiers,
+                action,
+                terminal_mode.intersects(TermMode::MOUSE_MODE),
+                state.mouse_position_on_grid,
+            ));
+        }
         if action == BindingAction::LinkOpen {
-            eprintln!("[iced_term] -> LinkOpen at {:?}", state.mouse_position_on_grid);
             commands.push(Command::ProcessLink(
                 LinkAction::Open,
                 state.mouse_position_on_grid,

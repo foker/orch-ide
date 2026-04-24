@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::net::TcpStream;
+use std::time::Duration;
 use serde_json;
 
 #[derive(Debug, Clone)]
@@ -18,6 +20,7 @@ pub struct SubRepo {
     pub unpushed_commits: u32,
     pub pr: PrStatus,
     pub repo_url: String,
+    pub dev_servers: Vec<(String, bool)>, // (url, running)
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +126,8 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
 
+        let dev_servers = detect_dev_servers(git_dir);
+
         sub_repos.push(SubRepo {
             name,
             branch: branch.clone(),
@@ -131,6 +136,7 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
             unpushed_commits: unpushed,
             pr,
             repo_url,
+            dev_servers,
         });
     }
 
@@ -156,11 +162,28 @@ fn get_git_info_impl(repo_path: &Path, check_pr: bool) -> Option<GitInfo> {
     })
 }
 
-/// Check PR status for a branch using `gh` CLI
+/// Check PR status for a branch using GitHub REST API via `gh api`.
+/// Uses `?head=<owner>:<branch>` filter — works regardless of PR count in the repo.
 fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
-    // Compatible with gh 2.0+: get all PRs and filter by headRefName
+    // Get owner/repo
+    let name_with_owner = Command::new("gh")
+        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if name_with_owner.is_empty() { return PrStatus::None; }
+    let owner = name_with_owner.split('/').next().unwrap_or("");
+    if owner.is_empty() { return PrStatus::None; }
+
+    let endpoint = format!(
+        "repos/{}/pulls?head={}:{}&state=all&per_page=5",
+        name_with_owner, owner, branch
+    );
     let output = Command::new("gh")
-        .args(["pr", "list", "--state", "all", "--json", "number,state,headRefName", "--limit", "50"])
+        .args(["api", &endpoint])
         .current_dir(repo_path)
         .output();
 
@@ -168,27 +191,31 @@ fn get_pr_status(repo_path: &Path, branch: &str) -> PrStatus {
     if !out.status.success() { return PrStatus::None; }
 
     let text = String::from_utf8_lossy(&out.stdout);
-    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
-        // Find PR matching our branch
-        for pr in &arr {
-            let head = pr.get("headRefName").and_then(|s| s.as_str()).unwrap_or("");
-            if head == branch {
-                let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
-                let state = pr.get("state").and_then(|s| s.as_str()).unwrap_or("");
-                let label = format!("#{}", number);
-                return match state {
-                    "OPEN" => PrStatus::Open(label),
-                    "MERGED" => PrStatus::Merged(label),
-                    _ => PrStatus::None,
-                };
-            }
-        }
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return PrStatus::None; };
+    // Prefer open PR, then most recent
+    let mut best: Option<&serde_json::Value> = None;
+    for pr in &arr {
+        let state = pr.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        if state == "open" { best = Some(pr); break; }
+        if best.is_none() { best = Some(pr); }
     }
-
-    PrStatus::None
+    let Some(pr) = best else { return PrStatus::None; };
+    let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+    let state = pr.get("state").and_then(|s| s.as_str()).unwrap_or("");
+    let merged = pr.get("merged_at").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    let label = format!("#{}", number);
+    if state == "open" {
+        PrStatus::Open(label)
+    } else if merged {
+        PrStatus::Merged(label)
+    } else {
+        PrStatus::None
+    }
 }
 
-/// Fetch deployments for a branch via gh API
+/// Fetch deployments for a branch via gh API.
+/// Uses `?ref=<sha>` filter against HEAD commit — GitHub attaches deployments to SHAs,
+/// and the branch-name fallback catches cases where the HEAD moved locally.
 pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
     // (env, state, url)
     let branch = Command::new("git")
@@ -202,6 +229,15 @@ pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
 
     if branch.is_empty() || branch == "main" || branch == "master" { return Vec::new(); }
 
+    let head_sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
     let repo_name = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
         .current_dir(repo_path)
@@ -213,33 +249,56 @@ pub fn get_deployments(repo_path: &Path) -> Vec<(String, String, String)> {
 
     if repo_name.is_empty() { return Vec::new(); }
 
-    // Get recent deployments and match by branch name in environment/description
-    let endpoint = format!("repos/{}/deployments?per_page=30", repo_name);
-    let output = Command::new("gh")
-        .args(["api", &endpoint])
-        .current_dir(repo_path)
-        .output();
+    // Primary: query by HEAD SHA (deployments are attached to commit SHAs, not branch names)
+    let mut deployments: Vec<serde_json::Value> = Vec::new();
+    if !head_sha.is_empty() {
+        let endpoint = format!("repos/{}/deployments?ref={}&per_page=30", repo_name, head_sha);
+        if let Ok(out) = Command::new("gh").args(["api", &endpoint]).current_dir(repo_path).output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    deployments = arr;
+                }
+            }
+        }
+    }
 
-    let Ok(out) = output else { return Vec::new(); };
-    if !out.status.success() { return Vec::new(); }
+    // Fallback: query by branch ref (if deployment was created from a different SHA)
+    if deployments.is_empty() {
+        let endpoint = format!("repos/{}/deployments?ref={}&per_page=30", repo_name, branch);
+        if let Ok(out) = Command::new("gh").args(["api", &endpoint]).current_dir(repo_path).output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    deployments = arr;
+                }
+            }
+        }
+    }
 
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Ok(deployments) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else { return Vec::new(); };
-
-    // Match by exact branch name in description or ref
-    let branch_lower = branch.to_lowercase();
+    // Last-resort: scan recent deployments and match by description (legacy behavior)
+    if deployments.is_empty() {
+        let endpoint = format!("repos/{}/deployments?per_page=50", repo_name);
+        if let Ok(out) = Command::new("gh").args(["api", &endpoint]).current_dir(repo_path).output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    let branch_lower = branch.to_lowercase();
+                    deployments = arr.into_iter().filter(|d| {
+                        let description = d.get("description").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let ref_field = d.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                        description.contains(&branch_lower) || ref_field == branch
+                    }).collect();
+                }
+            }
+        }
+    }
 
     let mut results = Vec::new();
     let mut seen_envs = std::collections::HashSet::new();
     for d in &deployments {
         let env = d.get("environment").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let description = d.get("description").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-        let ref_field = d.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Match by exact branch name in description or ref field
-        let matches = description.contains(&branch_lower) || ref_field == branch;
-
-        if !matches || seen_envs.contains(&env) { continue; }
+        if seen_envs.contains(&env) { continue; }
         seen_envs.insert(env.clone());
 
         let statuses_url = d.get("statuses_url").and_then(|v| v.as_str()).unwrap_or("");
@@ -317,4 +376,49 @@ fn scan_for_git(dir: &Path, depth: usize, max_depth: usize, repos: &mut Vec<Path
         // Recurse deeper
         scan_for_git(&path, depth + 1, max_depth, repos);
     }
+}
+
+/// Detect local dev servers from .orchide-devserver marker file in repo root.
+/// Each non-empty, non-comment line is a URL (e.g. http://localhost:3011).
+/// Returns Vec<(url, running)> where running = TCP port responds.
+pub fn detect_dev_servers(repo_path: &Path) -> Vec<(String, bool)> {
+    let marker = repo_path.join(".orchide-devserver");
+    if !marker.exists() {
+        return Vec::new();
+    }
+
+    let content = match std::fs::read_to_string(&marker) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|url| {
+            let url = url.to_string();
+            let running = check_url_port(&url);
+            (url, running)
+        })
+        .collect()
+}
+
+/// Try TCP connect to the host:port extracted from a URL.
+fn check_url_port(url: &str) -> bool {
+    let stripped = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let addr = if stripped.contains(':') {
+        stripped.split('/').next().unwrap_or(stripped).to_string()
+    } else {
+        // default port 80/443
+        let port = if url.starts_with("https") { 443 } else { 80 };
+        format!("{}:{}", stripped.split('/').next().unwrap_or(stripped), port)
+    };
+    TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| ([127, 0, 0, 1], 0).into()),
+        Duration::from_millis(200),
+    )
+    .is_ok()
 }

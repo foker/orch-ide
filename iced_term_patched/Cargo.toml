@@ -57,3 +57,6 @@ version = "5.3.2"
 [dependencies.tokio]
 version = "1.49.0"
 features = ["full"]
+
+[dependencies.chrono]
+version = "0.4"

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.5";
+const APP_VERSION: &str = "0.1.6";
 
 fn main() -> iced::Result {
     logging::init();
@@ -178,6 +178,9 @@ enum Message {
     AddQuickPrompt, RemoveQuickPrompt(usize), QuickPromptInput(String),
     UpdateCheckResult(Option<String>), // Some("0.2.0") if newer version available
     DismissUpdate,
+    TerminalExited(usize, usize), // pi, si — terminal gracefully stopped, now remove
+    ProjectTerminalsExited(usize), // pi — all terminals stopped, now move to trash in async
+    ProjectDirTrashed(usize, Result<(), String>), // pi, result of trash operation
     ResizeSidebar(f32),
     ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
     KeyboardEvent(iced::keyboard::Event),
@@ -221,6 +224,10 @@ struct App {
     hovered_card: Option<(usize, usize)>,
     tick_count: u32,
     blink_on: bool,
+    // Tracks which projects currently have git/deploy fetches in flight.
+    // Project is considered "refreshing" while either set contains its index.
+    refresh_pending_git: std::collections::HashSet<usize>,
+    refresh_pending_deps: std::collections::HashSet<usize>,
 }
 
 impl Default for App {
@@ -235,6 +242,7 @@ impl Default for App {
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, date_prefix_enabled: true, hovered_card: None, tick_count: 0, blink_on: true,
+            refresh_pending_git: std::collections::HashSet::new(), refresh_pending_deps: std::collections::HashSet::new(),
         }
     }
 }
@@ -276,7 +284,18 @@ impl App {
             async { check_latest_version().await },
             Message::UpdateCheckResult,
         );
-        (app, check_update)
+        // Populate sub-repo / PR / deployment info for every project in the background
+        // so sidebar cards are not empty on first launch. Each project runs independently —
+        // slow `gh` responses for one project won't block the UI or other projects.
+        let mut boot_tasks: Vec<Task<Message>> = vec![check_update];
+        for pi in 0..app.projects.len() {
+            let path = app.projects[pi].path.clone();
+            boot_tasks.push(Task::perform(
+                async move { git_info::get_git_info_with_pr(&path) },
+                move |info| Message::GitInfoFetched(pi, info),
+            ));
+        }
+        (app, Task::batch(boot_tasks))
     }
     fn tc(&self) -> TC { self.current_theme.colors() }
 
@@ -309,14 +328,20 @@ impl App {
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        // Get full PATH from login shell (picks up nvm, homebrew, etc.)
-        let full_path = std::process::Command::new("/bin/sh")
+        // Get full PATH from user's login shell (preserves exact order from .zprofile/.zshrc)
+        let user_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let full_path = std::process::Command::new(&user_shell)
             .args(["-lc", "echo $PATH"])
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        // Prepend $HOME/.local/bin so native claude install check is satisfied
+        // (claude v2+ warns "Native installation exists but ~/.local/bin is not in your PATH"
+        //  if it doesn't see this entry in process.env.PATH, even when claude itself runs from there)
+        let full_path = prepend_local_bin(full_path);
+        app_log!("spawn_terminal: PATH={}", full_path);
         env.insert("PATH".to_string(), full_path);
 
         let settings = iced_term::settings::Settings {
@@ -354,6 +379,7 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let _guard = logging::perf(message_label(&message));
         match message {
             Message::OpenProject => {
                 Task::perform(async {
@@ -460,13 +486,19 @@ impl App {
             Message::CardHover(v) => { self.hovered_card = v; Task::none() }
             Message::SelectSession(pi, si) => {
                 app_log!("SelectSession: pi={} si={}", pi, si);
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() {
+                    app_log!("  SelectSession ignored: stale indices (projects={}, sessions={})",
+                        self.projects.len(),
+                        self.projects.get(pi).map(|p| p.sessions.len()).unwrap_or(0));
+                    return Task::none();
+                }
                 self.active_session = Some((pi, si));
                 self.active_project = Some(pi);
                 self.file_entries = explorer::read_directory(&self.projects[pi].path, 0);
                 self.show_deployment_dropdown = false;
                 // Spawn terminal if it doesn't exist (e.g. after restart)
                 let has_term = self.terminals.iter().any(|(k, _)| *k == (pi, si));
-                if !has_term && pi < self.projects.len() && si < self.projects[pi].sessions.len() {
+                if !has_term {
                     self.spawn_session_terminal(pi, si, true);
                 }
                 // Fetch git info + deployments async (non-blocking)
@@ -487,17 +519,34 @@ impl App {
             }
             Message::KillSession(pi, si) => {
                 app_log!("KillSession: pi={} si={}", pi, si);
-                // Remove terminal
+                // Send Ctrl+C and exit to gracefully stop claude
+                if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"\x03\x03".to_vec())
+                    ));
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"exit\n".to_vec())
+                    ));
+                }
+                // Wait 500ms then clean up
+                Task::perform(
+                    async { tokio::time::sleep(Duration::from_millis(500)).await; },
+                    move |_| Message::TerminalExited(pi, si),
+                )
+            }
+            Message::TerminalExited(pi, si) => {
+                app_log!("TerminalExited: pi={} si={}", pi, si);
                 self.terminals.retain(|(k, _)| *k != (pi, si));
-                // Remove session
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
                     self.projects[pi].sessions.remove(si);
                 }
-                // Fix active session reference
-                if self.active_session == Some((pi, si)) {
-                    self.active_session = None;
+                // Fix active_session: drop it if it pointed at the removed session,
+                // shift index down if it pointed at a later session in the same project.
+                match self.active_session {
+                    Some((ap, asi)) if ap == pi && asi == si => self.active_session = None,
+                    Some((ap, asi)) if ap == pi && asi > si => self.active_session = Some((ap, asi - 1)),
+                    _ => {}
                 }
-                // Fix terminal indices after removal
                 for (key, _) in &mut self.terminals {
                     if key.0 == pi && key.1 > si { key.1 -= 1; }
                 }
@@ -561,17 +610,55 @@ impl App {
             }
             Message::ConfirmDeleteDir(pi) => {
                 if pi < self.projects.len() {
-                    let path = self.projects[pi].path.clone();
-                    app_log!("DELETING directory: {:?}", path);
-                    if let Err(e) = std::fs::remove_dir_all(&path) {
-                        app_log!("Failed to delete: {}", e);
+                    // Send Ctrl+C + exit to all terminals in this project
+                    let session_count = self.projects[pi].sessions.len();
+                    for si in 0..session_count {
+                        if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                            ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(b"\x03\x03".to_vec())
+                            ));
+                            ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                                iced_term::backend::Command::Write(b"exit\n".to_vec())
+                            ));
+                        }
                     }
-                    // Also remove from projects list
                     self.confirm_delete = None;
-                    return self.update(Message::RemoveProject(pi));
+                    // Wait 800ms for terminals to die, then delete
+                    return Task::perform(
+                        async { tokio::time::sleep(Duration::from_millis(800)).await; },
+                        move |_| Message::ProjectTerminalsExited(pi),
+                    );
                 }
                 self.confirm_delete = None;
                 Task::none()
+            }
+            Message::ProjectTerminalsExited(pi) => {
+                if pi < self.projects.len() {
+                    let path = self.projects[pi].path.clone();
+                    app_log!("TRASHING directory: {:?}", path);
+                    // Move to Trash on a blocking worker thread — never block the UI thread.
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                trash::delete(&path).map_err(|e| e.to_string())
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                        },
+                        move |res| Message::ProjectDirTrashed(pi, res),
+                    );
+                }
+                Task::none()
+            }
+            Message::ProjectDirTrashed(pi, res) => {
+                match &res {
+                    Ok(_) => app_log!("Trashed project dir: pi={}", pi),
+                    Err(e) => app_log!("Failed to trash: {}", e),
+                }
+                // Always remove project from the list even if trash failed — the user
+                // asked for it, and they can see the error via logs.
+                return self.update(Message::RemoveProject(pi));
             }
             Message::StartRenameSession(pi, si) => {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
@@ -611,6 +698,7 @@ impl App {
             Message::FetchGitInfo(pi) => {
                 app_log!("FetchGitInfo: pi={}", pi);
                 if pi >= self.projects.len() { return Task::none(); }
+                self.refresh_pending_git.insert(pi);
                 let path = self.projects[pi].path.clone();
                 Task::perform(
                     async move { git_info::get_git_info_with_pr(&path) },
@@ -619,6 +707,7 @@ impl App {
             }
             Message::GitInfoFetched(pi, info) => {
                 app_log!("GitInfoFetched: pi={} has_info={}", pi, info.is_some());
+                self.refresh_pending_git.remove(&pi);
                 if let Some(info) = info {
                     if pi < self.projects.len() {
                         self.projects[pi].branch = info.branch.clone();
@@ -631,12 +720,14 @@ impl App {
                                 sr.deployments = deps.clone();
                             }
                         }
+                        // dev_servers already populated from git_info (includes TCP check)
                     }
                 }
                 Task::none()
             }
             Message::FetchDeployments(pi) => {
                 if pi >= self.projects.len() { return Task::none(); }
+                self.refresh_pending_deps.insert(pi);
                 let sub_repos: Vec<(String, PathBuf)> = {
                     let git_dirs = git_info::find_git_repos_pub(&self.projects[pi].path, 3);
                     git_dirs.iter().map(|gd| {
@@ -663,6 +754,7 @@ impl App {
             }
             Message::DeploymentsFetched(pi, deps) => {
                 app_log!("DeploymentsFetched: pi={} total={}", pi, deps.iter().map(|(_, d)| d.len()).sum::<usize>());
+                self.refresh_pending_deps.remove(&pi);
                 if pi < self.projects.len() {
                     for sr in &mut self.projects[pi].sub_repos {
                         sr.deployments.clear();
@@ -815,6 +907,7 @@ impl App {
             }
             Message::Blink => {
                 self.blink_on = !self.blink_on;
+                self.tick_count = self.tick_count.wrapping_add(1);
                 Task::none()
             }
             Message::KeyboardEvent(event) => {
@@ -845,6 +938,8 @@ impl App {
                         }
                     }
                 }
+                // Dump accumulated perf metrics so we can see what dominates CPU
+                logging::metrics::flush(1);
                 Task::none()
             }
             Message::RefreshAll => {
@@ -881,6 +976,7 @@ impl App {
     // ─── VIEW ───
 
     fn view(&self) -> Element<'_, Message> {
+        let _guard = logging::perf("view");
         let tc = self.tc();
         let center = if let Some((pi, ref files)) = self.confirm_delete {
             self.view_confirm_delete(pi, files)
@@ -1214,16 +1310,24 @@ impl App {
     fn view_terminal(&self) -> Element<'_, Message> {
         let tc = self.tc();
 
-        if self.active_session.is_none() {
-            return container(
-                column![
-                    text("◆").size(32).color(tc.text_muted),
-                    text("Select or create a session").size(14).color(tc.text_muted),
-                ].spacing(8).align_x(iced::Alignment::Center)
-            ).center(Fill).height(Fill).into();
-        }
-
-        let (pi, si) = self.active_session.unwrap();
+        // Validate active_session: if indices are stale (e.g. after deletion races),
+        // render the empty state instead of indexing OOB and aborting via panic_cannot_unwind
+        // inside the macOS event-loop block.
+        let (pi, si) = match self.active_session {
+            Some((pi, si))
+                if pi < self.projects.len() && si < self.projects[pi].sessions.len() =>
+            {
+                (pi, si)
+            }
+            _ => {
+                return container(
+                    column![
+                        text("◆").size(32).color(tc.text_muted),
+                        text("Select or create a session").size(14).color(tc.text_muted),
+                    ].spacing(8).align_x(iced::Alignment::Center)
+                ).center(Fill).height(Fill).into();
+            }
+        };
         let project = &self.projects[pi];
         let session = &project.sessions[si];
         let sc = tc.status_color(&session.status);
@@ -1242,12 +1346,22 @@ impl App {
         // Status + session name + path row
         let mut top_row = Row::new().spacing(8).align_y(iced::Alignment::Center);
         top_row = top_row.push(chip(status_text, sc));
-        top_row = top_row.push(
-            tip(button(text("⟳").size(10).color(tc.text_muted))
-                .on_press(Message::RefreshProject(pi))
-                .style(button::text).padding([2, 4]),
-                "Refresh git & deployments")
-        );
+        let is_refreshing = self.refresh_pending_git.contains(&pi) || self.refresh_pending_deps.contains(&pi);
+        let (refresh_glyph, refresh_color) = if is_refreshing {
+            // Animated spinner: cycle through frames via blink_on / tick_count
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let frame = frames[(self.tick_count as usize) % frames.len()];
+            (frame.to_string(), tc.blue)
+        } else {
+            ("⟳".to_string(), tc.text_muted)
+        };
+        let mut refresh_btn = button(text(refresh_glyph).size(10).color(refresh_color))
+            .style(button::text).padding([2, 4]);
+        if !is_refreshing {
+            refresh_btn = refresh_btn.on_press(Message::RefreshProject(pi));
+        }
+        let tip_label = if is_refreshing { "Refreshing…" } else { "Refresh git & deployments" };
+        top_row = top_row.push(tip(refresh_btn, tip_label));
         top_row = top_row.push(Space::new().width(Fill));
         top_row = top_row.push(text(project.path.display().to_string()).size(9).font(MONO_FONT).color(tc.text_muted));
 
@@ -1309,6 +1423,18 @@ impl App {
                     stats = stats.push(text(dep_icon).size(11));
                 }
             }
+            // Local dev servers
+            for ds in &sr.dev_servers {
+                let icon = if ds.running { "🖥" } else { "⬜" };
+                let color = if ds.running { tc.green } else { tc.text_muted };
+                let short = ds.url.replace("http://", "").replace("https://", "");
+                let url = ds.url.clone();
+                stats = stats.push(
+                    button(text(format!("{}{}", icon, short)).size(10).font(MONO_FONT).color(color))
+                        .on_press(Message::OpenUrl(url))
+                        .style(button::text).padding(0)
+                );
+            }
             card_col = card_col.push(stats);
 
             branch_cards = branch_cards.push(
@@ -1366,7 +1492,14 @@ impl App {
         let mut bottom_row = Row::new().spacing(4).padding([3, 8]).align_y(iced::Alignment::Center);
         for prompt in &self.quick_prompts {
             let p = prompt.clone();
-            let short = if prompt.len() > 25 { format!("{}...", &prompt[..22]) } else { prompt.clone() };
+            // Count chars, not bytes — truncating at a byte index in the middle of a multi-byte
+            // char (e.g. Cyrillic) panics and takes the app down via the winit event-loop block.
+            let short = if prompt.chars().count() > 25 {
+                let truncated: String = prompt.chars().take(22).collect();
+                format!("{}...", truncated)
+            } else {
+                prompt.clone()
+            };
             bottom_row = bottom_row.push(
                 button(text(short).size(9).color(tc.text_secondary))
                     .on_press(Message::SendQuickPrompt(p))
@@ -1574,8 +1707,9 @@ impl App {
             .unwrap_or_default();
 
         let mut content = Column::new().spacing(12).padding(24).max_width(600);
-        content = content.push(text("Delete Directory?").size(18).color(tc.text_primary));
+        content = content.push(text("Move Directory to Trash?").size(18).color(tc.text_primary));
         content = content.push(text(dir_name).size(12).font(MONO_FONT).color(tc.text_secondary));
+        content = content.push(text("Will be moved to macOS Trash — recoverable from there.").size(11).color(tc.text_muted));
 
         if files.is_empty() {
             content = content.push(text("No uncommitted changes.").size(12).color(tc.text_muted));
@@ -1600,7 +1734,7 @@ impl App {
                     .style(button::secondary)
                     .padding([8, 20]),
                 Space::new().width(12),
-                button(text("Delete").size(13).color(tc.red))
+                button(text("Move to Trash").size(13).color(tc.red))
                     .on_press(Message::ConfirmDeleteDir(pi))
                     .style(button::secondary)
                     .padding([8, 20]),
@@ -1617,7 +1751,16 @@ impl App {
             iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
         ];
-        for (_, ti) in &self.terminals { subs.push(ti.terminal.subscription().map(Message::TermEvent)); }
+        // Only subscribe to the visible terminal. Background terminals keep running
+        // in their own PTY threads (claude sessions stay alive), but their output
+        // no longer triggers redraws of the iced UI on every byte — which was
+        // causing GPU/Metal drawable contention with other apps (e.g. browsers).
+        // When the user switches sessions, this subscription list is rebuilt.
+        if let Some(active) = self.active_session {
+            if let Some((_, ti)) = self.terminals.iter().find(|(k, _)| *k == active) {
+                subs.push(ti.terminal.subscription().map(Message::TermEvent));
+            }
+        }
         Subscription::batch(subs)
     }
 }
@@ -1664,14 +1807,79 @@ fn to_sub_repo_views(info: &git_info::GitInfo) -> Vec<session::SubRepoView> {
             pr_number: pr_num,
             pr_url,
             deployments: Vec::new(),
+            dev_servers: r.dev_servers.iter().map(|(url, running)| {
+                session::DevServerInfo { url: url.clone(), running: *running }
+            }).collect(),
         }
     }).collect()
 }
 
+/// Stable short label per Message variant used for perf bucketing.
+/// Kept manual (vs Debug) so labels don't include payload data.
+fn message_label(m: &Message) -> &'static str {
+    match m {
+        Message::OpenProject => "OpenProject",
+        Message::ProjectPicked(_) => "ProjectPicked",
+        Message::NewProject => "NewProject",
+        Message::NewProjectFolderPicked(_) => "NewProjectFolderPicked",
+        Message::AddSession(_) => "AddSession",
+        Message::SessionNameSubmit(_, _) => "SessionNameSubmit",
+        Message::SessionNameChanged(_) => "SessionNameChanged",
+        Message::ToggleLaunchClaude => "ToggleLaunchClaude",
+        Message::SelectSession(_, _) => "SelectSession",
+        Message::KillSession(_, _) => "KillSession",
+        Message::MakeIdle(_, _) => "MakeIdle",
+        Message::CardHover(_) => "CardHover",
+        Message::StartRenameSession(_, _) => "StartRenameSession",
+        Message::RenameSessionInput(_) => "RenameSessionInput",
+        Message::RenameSessionSubmit => "RenameSessionSubmit",
+        Message::SetSessionColor(_, _, _) => "SetSessionColor",
+        Message::SetNewSessionColor(_) => "SetNewSessionColor",
+        Message::RemoveProject(_) => "RemoveProject",
+        Message::DeleteProjectDir(_) => "DeleteProjectDir",
+        Message::ConfirmDeleteDir(_) => "ConfirmDeleteDir",
+        Message::CancelDelete => "CancelDelete",
+        Message::ToggleProjectExpand(_) => "ToggleProjectExpand",
+        Message::OpenFile(_) => "OpenFile",
+        Message::RefreshProject(_) => "RefreshProject",
+        Message::FetchGitInfo(_) => "FetchGitInfo",
+        Message::GitInfoFetched(_, _) => "GitInfoFetched",
+        Message::FetchDeployments(_) => "FetchDeployments",
+        Message::DeploymentsFetched(_, _) => "DeploymentsFetched",
+        Message::ToggleDeploymentDropdown => "ToggleDeploymentDropdown",
+        Message::OpenUrl(_) => "OpenUrl",
+        Message::VoiceToggle => "VoiceToggle",
+        Message::VoiceResult(_) => "VoiceResult",
+        Message::GroqKeyChanged(_) => "GroqKeyChanged",
+        Message::ToggleDangerouslySkipPermissions => "ToggleDangerouslySkipPermissions",
+        Message::ToggleDatePrefix => "ToggleDatePrefix",
+        Message::SendQuickPrompt(_) => "SendQuickPrompt",
+        Message::AddQuickPrompt => "AddQuickPrompt",
+        Message::RemoveQuickPrompt(_) => "RemoveQuickPrompt",
+        Message::QuickPromptInput(_) => "QuickPromptInput",
+        Message::UpdateCheckResult(_) => "UpdateCheckResult",
+        Message::DismissUpdate => "DismissUpdate",
+        Message::TerminalExited(_, _) => "TerminalExited",
+        Message::ProjectTerminalsExited(_) => "ProjectTerminalsExited",
+        Message::ProjectDirTrashed(_, _) => "ProjectDirTrashed",
+        Message::ResizeSidebar(_) => "ResizeSidebar",
+        Message::ToggleFileExpand(_) => "ToggleFileExpand",
+        Message::RefreshExplorer => "RefreshExplorer",
+        Message::RefreshAll => "RefreshAll",
+        Message::Tick => "Tick",
+        Message::Blink => "Blink",
+        Message::KeyboardEvent(_) => "KeyboardEvent",
+        Message::ToggleSettings => "ToggleSettings",
+        Message::SetTheme(_) => "SetTheme",
+        Message::TermEvent(_) => "TermEvent",
+    }
+}
+
 /// Find claude binary path
 fn which_claude() -> String {
-    // Use login shell to resolve claude path (picks up nvm, homebrew, etc.)
-    if let Ok(out) = std::process::Command::new("/bin/sh")
+    // Use user's login shell to resolve claude path (preserves PATH order)
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
         .args(["-lc", "which claude"])
         .output()
     {
@@ -1704,6 +1912,24 @@ fn which_claude() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Prepend $HOME/.local/bin to a PATH string if not already present.
+fn prepend_local_bin(path: String) -> String {
+    let Some(home) = dirs::home_dir() else { return path; };
+    let local_bin = home.join(".local/bin");
+    let local_bin_str = local_bin.to_string_lossy().to_string();
+    let already_present = path
+        .split(':')
+        .map(|e| e.trim_end_matches('/'))
+        .any(|e| e == local_bin_str);
+    if already_present {
+        path
+    } else if path.is_empty() {
+        local_bin_str
+    } else {
+        format!("{}:{}", local_bin_str, path)
+    }
 }
 
 fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: &str) -> Element<'a, Message> {

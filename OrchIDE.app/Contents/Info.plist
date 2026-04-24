@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.nikitagerasimov.orch-ide</string>
     <key>CFBundleVersion</key>
-    <string>0.1.6</string>
+    <string>0.1.7</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.6</string>
+    <string>0.1.7</string>
     <key>CFBundleExecutable</key>
     <string>orch-ide</string>
     <key>CFBundleIconFile</key>

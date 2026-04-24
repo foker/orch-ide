@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.6";
+const APP_VERSION: &str = "0.1.7";
 
 fn main() -> iced::Result {
     logging::init();
@@ -1751,15 +1751,22 @@ impl App {
             iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
         ];
-        // Only subscribe to the visible terminal. Background terminals keep running
-        // in their own PTY threads (claude sessions stay alive), but their output
-        // no longer triggers redraws of the iced UI on every byte — which was
-        // causing GPU/Metal drawable contention with other apps (e.g. browsers).
-        // When the user switches sessions, this subscription list is rebuilt.
-        if let Some(active) = self.active_session {
-            if let Some((_, ti)) = self.terminals.iter().find(|(k, _)| *k == active) {
-                subs.push(ti.terminal.subscription().map(Message::TermEvent));
-            }
+        // Subscribe to every terminal, not just the active one.
+        //
+        // Why: the terminal's subscription is the only consumer of the bounded
+        // mpsc channel that alacritty's PTY reader thread writes into. If we
+        // skip the subscription for a background terminal, its claude session
+        // keeps producing output, the channel fills up, the PTY reader blocks
+        // in `block_on` — and the next time anything (including a KillSession
+        // from the UI) tries to send into that channel, the main thread
+        // deadlocks on the channel's mutex. Full UI freeze.
+        //
+        // The CPU/GPU win from "subscribe only active" (v0.1.6) is not worth
+        // the freeze, so draining every terminal is mandatory. Background
+        // output will trigger redraws, but for on-screen widgets only the
+        // active terminal is rendered, so GPU cost stays bounded.
+        for (_, ti) in &self.terminals {
+            subs.push(ti.terminal.subscription().map(Message::TermEvent));
         }
         Subscription::batch(subs)
     }

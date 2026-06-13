@@ -39,17 +39,38 @@ enum AppTheme { Midnight, VsCode, Darcula, GitHub, Monokai, Catppuccin }
 enum Screen { Ide, Board }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentBackend { ClaudeCode, OpenCode }
+enum AgentBackend { ClaudeCode, OpenCode, Codex, XiaomiMimo }
+
+/// Model id the Xiaomi MiMo backend pins opencode to (provider/model).
+const MIMO_MODEL: &str = "mimo/mimo-v2.5-pro";
 
 impl AgentBackend {
+    fn all() -> &'static [AgentBackend] {
+        &[AgentBackend::ClaudeCode, AgentBackend::OpenCode, AgentBackend::Codex, AgentBackend::XiaomiMimo]
+    }
     fn label(&self) -> &'static str {
-        match self { AgentBackend::ClaudeCode => "Claude Code", AgentBackend::OpenCode => "OpenCode" }
+        match self {
+            AgentBackend::ClaudeCode => "Claude Code",
+            AgentBackend::OpenCode => "OpenCode",
+            AgentBackend::Codex => "Codex",
+            AgentBackend::XiaomiMimo => "Xiaomi MiMo",
+        }
     }
     fn from_str(s: &str) -> Self {
-        match s { "OpenCode" => AgentBackend::OpenCode, _ => AgentBackend::ClaudeCode }
+        match s {
+            "OpenCode" => AgentBackend::OpenCode,
+            "Codex" => AgentBackend::Codex,
+            "XiaomiMimo" => AgentBackend::XiaomiMimo,
+            _ => AgentBackend::ClaudeCode,
+        }
     }
     fn as_str(&self) -> &'static str {
-        match self { AgentBackend::ClaudeCode => "ClaudeCode", AgentBackend::OpenCode => "OpenCode" }
+        match self {
+            AgentBackend::ClaudeCode => "ClaudeCode",
+            AgentBackend::OpenCode => "OpenCode",
+            AgentBackend::Codex => "Codex",
+            AgentBackend::XiaomiMimo => "XiaomiMimo",
+        }
     }
 }
 
@@ -415,12 +436,14 @@ impl App {
         // Determine program and args
         let claude_path = which_claude();
         let opencode_path = which_opencode();
+        let codex_path = which_codex();
         let (program, args) = build_agent_command(
             self.agent_backend,
             self.launch_agent,
             resume,
             &claude_path,
             &opencode_path,
+            &codex_path,
             &session_name,
             self.dangerously_skip_permissions,
         );
@@ -2352,20 +2375,21 @@ impl App {
         );
 
         // Agent backend select
-        let backend_btn = |label: &str, b: AgentBackend| {
+        let mut backend_row = Row::new().spacing(6);
+        for &b in AgentBackend::all() {
             let active = self.agent_backend == b;
-            button(text(label.to_string()).size(11)
-                .color(if active { tc.text_primary } else { tc.text_muted }))
-                .on_press(Message::SetAgentBackend(b))
-                .style(if active { button::secondary } else { button::text }).padding([4,12])
-        };
+            backend_row = backend_row.push(
+                button(text(b.label()).size(11)
+                    .color(if active { tc.text_primary } else { tc.text_muted }))
+                    .on_press(Message::SetAgentBackend(b))
+                    .style(if active { button::secondary } else { button::text }).padding([4,12])
+            );
+        }
         let agent_section = column![
             text("Agent Backend").size(12).color(tc.text_muted),
-            row![
-                backend_btn(AgentBackend::ClaudeCode.label(), AgentBackend::ClaudeCode),
-                backend_btn(AgentBackend::OpenCode.label(), AgentBackend::OpenCode),
-            ].spacing(6),
-            text("OpenCode sessions have no live status tracking (no hooks).").size(9).color(tc.text_muted),
+            backend_row,
+            text("Only Claude Code has live status tracking (hooks). OpenCode / Codex /").size(9).color(tc.text_muted),
+            text("Xiaomi MiMo run their own TUI; MiMo = opencode pinned to mimo-v2.5-pro.").size(9).color(tc.text_muted),
         ].spacing(6);
 
         // Notion section
@@ -2743,6 +2767,7 @@ fn build_agent_command(
     resume: bool,
     claude_path: &str,
     opencode_path: &str,
+    codex_path: &str,
     session_name: &str,
     skip_perms: bool,
 ) -> (String, Vec<String>) {
@@ -2752,6 +2777,10 @@ fn build_agent_command(
     }
     match backend {
         AgentBackend::OpenCode => (opencode_path.to_string(), vec![]),
+        AgentBackend::Codex => (codex_path.to_string(), vec![]),
+        // Xiaomi MiMo is an OpenAI-compatible provider configured in opencode;
+        // launch opencode pinned to the mimo model.
+        AgentBackend::XiaomiMimo => (opencode_path.to_string(), vec!["-m".to_string(), MIMO_MODEL.to_string()]),
         AgentBackend::ClaudeCode => {
             let skip_flag = if skip_perms { " --dangerously-skip-permissions" } else { "" };
             if resume {
@@ -2790,6 +2819,28 @@ fn which_opencode() -> String {
         if std::path::Path::new(&f).exists() { return f; }
     }
     "opencode".to_string()
+}
+
+/// Find codex binary path (mirrors which_claude).
+fn which_codex() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
+        .args(["-lc", "which codex"]).output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() { return p; }
+        }
+    }
+    let fallbacks = [
+        Some("/opt/homebrew/bin/codex".to_string()),
+        Some("/usr/local/bin/codex".to_string()),
+        dirs::home_dir().map(|h| h.join(".codex/bin/codex").to_string_lossy().to_string()),
+    ];
+    for f in fallbacks.into_iter().flatten() {
+        if std::path::Path::new(&f).exists() { return f; }
+    }
+    "codex".to_string()
 }
 
 /// Sanitize a task title into a safe directory name (kebab-case).
@@ -2913,7 +2964,7 @@ mod agent_cmd_tests {
     fn claude_fresh_uses_name_flag() {
         let (prog, args) = build_agent_command(
             AgentBackend::ClaudeCode, true, false,
-            "/bin/claude", "/bin/opencode", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
         );
         assert_eq!(prog, "/bin/claude");
         assert_eq!(args, vec!["--name", "my task", "--dangerously-skip-permissions"]);
@@ -2923,7 +2974,7 @@ mod agent_cmd_tests {
     fn claude_resume_uses_continue_shell() {
         let (prog, args) = build_agent_command(
             AgentBackend::ClaudeCode, true, true,
-            "/bin/claude", "/bin/opencode", "my task", false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false,
         );
         assert_eq!(prog, "/bin/sh");
         assert_eq!(args[0], "-c");
@@ -2934,17 +2985,37 @@ mod agent_cmd_tests {
     fn opencode_runs_bare_in_cwd() {
         let (prog, args) = build_agent_command(
             AgentBackend::OpenCode, true, false,
-            "/bin/claude", "/bin/opencode", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
         );
         assert_eq!(prog, "/bin/opencode");
         assert!(args.is_empty());
     }
 
     #[test]
+    fn codex_runs_bare_in_cwd() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::Codex, true, false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+        );
+        assert_eq!(prog, "/bin/codex");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn mimo_runs_opencode_with_model() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::XiaomiMimo, true, false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+        );
+        assert_eq!(prog, "/bin/opencode");
+        assert_eq!(args, vec!["-m", "mimo/mimo-v2.5-pro"]);
+    }
+
+    #[test]
     fn plain_shell_when_agent_off() {
         let (prog, _args) = build_agent_command(
             AgentBackend::ClaudeCode, false, false,
-            "/bin/claude", "/bin/opencode", "x", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "x", true,
         );
         assert!(prog.ends_with("sh") || prog.ends_with("zsh") || prog.contains("/"));
     }

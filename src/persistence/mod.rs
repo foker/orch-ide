@@ -1,6 +1,15 @@
 use crate::session::ProjectGroup;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// A folder that was affiliated with a Notion task, so the user can reopen the
+/// same directory with the same session name later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLink {
+    pub path: PathBuf,
+    pub session_name: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppState {
@@ -24,6 +33,9 @@ pub struct AppState {
     pub notion_group_by_prop: Option<String>,
     #[serde(default = "default_agent_backend")]
     pub agent_backend: String,
+    /// task id -> folders affiliated with that Notion task
+    #[serde(default)]
+    pub task_links: HashMap<String, Vec<TaskLink>>,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }
@@ -75,6 +87,7 @@ mod tests {
             notion_database_id: Some("db123".into()),
             notion_group_by_prop: Some("Status".into()),
             agent_backend: "OpenCode".into(),
+            task_links: HashMap::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: AppState = serde_json::from_str(&json).unwrap();

@@ -235,11 +235,11 @@ enum Message {
     NotionSetGroupBy(String),
     NotionOpenTask(String),
     NotionCloseTask,
-    GhostOpenDir,
-    GhostNewDir,
-    GhostDirPicked(Option<PathBuf>),
-    GhostNewParentPicked(Option<PathBuf>),
-    GhostAnimTick,
+    TaskOpenDir,
+    TaskNewDir,
+    TaskDirPicked(Option<PathBuf>),
+    TaskNewParentPicked(Option<PathBuf>),
+    ReopenTaskLink(usize),
 }
 
 // ─── App ───
@@ -269,9 +269,7 @@ struct App {
     notion_loading: bool,
     screen: Screen,
     open_task: Option<String>,
-    ghost_task: Option<notion::NotionTask>,
-    ghost_anim: f32,      // 0.0 hidden → 1.0 fully shown
-    ghost_closing: bool,  // animating out; clear ghost_task when anim hits 0
+    task_links: std::collections::HashMap<String, Vec<persistence::TaskLink>>,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
@@ -310,7 +308,7 @@ impl Default for App {
             notion_token: String::new(), notion_database_id: None, notion_group_by_prop: None,
             notion_databases: Vec::new(), notion_schema: None, notion_tasks: Vec::new(),
             notion_error: None, notion_loading: false,
-            screen: Screen::Ide, open_task: None, ghost_task: None, ghost_anim: 0.0, ghost_closing: false,
+            screen: Screen::Ide, open_task: None, task_links: std::collections::HashMap::new(),
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -351,6 +349,7 @@ impl App {
             app.notion_database_id = state.notion_database_id;
             app.notion_group_by_prop = state.notion_group_by_prop;
             app.agent_backend = AgentBackend::from_str(&state.agent_backend);
+            app.task_links = state.task_links;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -460,6 +459,7 @@ impl App {
             notion_database_id: self.notion_database_id.clone(),
             notion_group_by_prop: self.notion_group_by_prop.clone(),
             agent_backend: self.agent_backend.as_str().to_string(),
+            task_links: self.task_links.clone(),
         });
     }
 
@@ -1133,58 +1133,31 @@ impl App {
                 Task::none()
             }
             Message::NotionSetGroupBy(pid) => { self.notion_group_by_prop = Some(pid); self.save_state(); Task::none() }
-            Message::NotionOpenTask(id) => {
-                self.open_task = Some(id.clone());
-                if let Some(t) = self.notion_tasks.iter().find(|t| t.id == id).cloned() {
-                    self.ghost_task = Some(t);
-                    self.ghost_closing = false;
-                    self.ghost_anim = 0.0; // start collapsed, slide-down animates in
-                }
-                Task::none()
-            }
-            Message::NotionCloseTask => {
-                self.open_task = None;
-                // animate ghost out instead of removing instantly
-                if self.ghost_task.is_some() { self.ghost_closing = true; }
-                Task::none()
-            }
-            Message::GhostAnimTick => {
-                const STEP: f32 = 0.14;
-                if self.ghost_closing {
-                    self.ghost_anim -= STEP;
-                    if self.ghost_anim <= 0.0 {
-                        self.ghost_anim = 0.0;
-                        self.ghost_closing = false;
-                        self.ghost_task = None;
-                    }
-                } else if self.ghost_anim < 1.0 {
-                    self.ghost_anim = (self.ghost_anim + STEP).min(1.0);
-                }
-                Task::none()
-            }
-            Message::GhostOpenDir => {
+            Message::NotionOpenTask(id) => { self.open_task = Some(id); Task::none() }
+            Message::NotionCloseTask => { self.open_task = None; Task::none() }
+            Message::TaskOpenDir => {
                 Task::perform(async {
-                    rfd::AsyncFileDialog::new().set_title("Open directory for new session")
+                    rfd::AsyncFileDialog::new().set_title("Open directory for this task's session")
                         .pick_folder().await.map(|h| h.path().to_path_buf())
-                }, Message::GhostDirPicked)
+                }, Message::TaskDirPicked)
             }
-            Message::GhostNewDir => {
+            Message::TaskNewDir => {
                 Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Select PARENT folder — new directory will be created inside")
                         .pick_folder().await.map(|h| h.path().to_path_buf())
-                }, Message::GhostNewParentPicked)
+                }, Message::TaskNewParentPicked)
             }
-            Message::GhostDirPicked(path) => {
-                if let (Some(p), true) = (path, self.ghost_task.is_some()) {
+            Message::TaskDirPicked(path) => {
+                if let (Some(p), Some(_)) = (path, self.current_open_task()) {
                     if p.is_dir() {
                         let pi = self.create_or_find_project(p);
-                        self.finish_session_from_task(pi);
+                        self.create_session_for_open_task(pi, None);
                     }
                 }
                 Task::none()
             }
-            Message::GhostNewParentPicked(parent) => {
-                if let (Some(parent), Some(task)) = (parent, self.ghost_task.clone()) {
+            Message::TaskNewParentPicked(parent) => {
+                if let (Some(parent), Some(task)) = (parent, self.current_open_task()) {
                     let base = sanitize_dir_name(&task.title);
                     let folder = if self.date_prefix_enabled {
                         format!("{}-{}", chrono::Local::now().format("%Y-%m-%d"), base)
@@ -1192,14 +1165,33 @@ impl App {
                     let new_path = parent.join(&folder);
                     if std::fs::create_dir_all(&new_path).is_ok() {
                         let pi = self.create_or_find_project(new_path);
-                        self.finish_session_from_task(pi);
+                        self.create_session_for_open_task(pi, None);
                     } else {
                         self.notion_error = Some("Could not create directory".into());
                     }
                 }
                 Task::none()
             }
+            Message::ReopenTaskLink(idx) => {
+                if let Some(task) = self.current_open_task() {
+                    if let Some(link) = self.task_links.get(&task.id).and_then(|v| v.get(idx)).cloned() {
+                        if !link.path.is_dir() {
+                            self.notion_error = Some(format!("Folder no longer exists: {}", link.path.display()));
+                        } else {
+                            let pi = self.create_or_find_project(link.path.clone());
+                            self.create_session_for_open_task(pi, Some(link.session_name.clone()));
+                        }
+                    }
+                }
+                Task::none()
+            }
         }
+    }
+
+    fn current_open_task(&self) -> Option<notion::NotionTask> {
+        self.open_task.as_ref()
+            .and_then(|id| self.notion_tasks.iter().find(|t| &t.id == id))
+            .cloned()
     }
 
     /// Find an existing project by path, or create one. Returns its index.
@@ -1223,9 +1215,11 @@ impl App {
         pi
     }
 
-    /// Write the task markdown file into project `pi` and spawn a session from it.
-    fn finish_session_from_task(&mut self, pi: usize) {
-        let Some(task) = self.ghost_task.clone() else { return; };
+    /// Write the open task's markdown into project `pi`, spawn a session, and
+    /// remember the (folder, session name) affiliation so it can be reopened.
+    /// `name_override` reuses a saved session name (reopen flow).
+    fn create_session_for_open_task(&mut self, pi: usize, name_override: Option<String>) {
+        let Some(task) = self.current_open_task() else { return; };
         if pi >= self.projects.len() { return; }
         let schema_props = self.notion_schema.as_ref().map(|s| s.props.clone()).unwrap_or_default();
         let md = task_to_markdown(&task, &schema_props);
@@ -1233,14 +1227,21 @@ impl App {
         let short = &stripped[..stripped.len().min(8)];
         let fname = format!("TASK-{}.md", short);
         let _ = std::fs::write(self.projects[pi].path.join(&fname), md);
-        let name = if task.title.trim().is_empty() { fname.clone() } else { task.title.clone() };
+        let name = name_override.unwrap_or_else(|| {
+            if task.title.trim().is_empty() { fname.clone() } else { task.title.clone() }
+        });
+        // remember the affiliation (dedupe by path + name)
+        let path = self.projects[pi].path.clone();
+        let links = self.task_links.entry(task.id.clone()).or_default();
+        if !links.iter().any(|l| l.path == path && l.session_name == name) {
+            links.push(persistence::TaskLink { path: path.clone(), session_name: name.clone() });
+        }
         self.projects[pi].sessions.push(Session::new(name));
         let si = self.projects[pi].sessions.len() - 1;
         self.active_project = Some(pi);
         self.active_session = Some((pi, si));
         self.spawn_session_terminal(pi, si, false);
         self.open_task = None;
-        self.ghost_closing = true; // slide the ghost away
         self.screen = Screen::Ide;
         self.save_state();
     }
@@ -1610,44 +1611,7 @@ impl App {
             seg("IDE", Screen::Ide), seg("Board", Screen::Board),
         ].spacing(4)).padding([8, 10]);
 
-        // Ghost card — new session from the currently-open Notion task.
-        // Lives at the TOP of the sessions list; slides down on open, up on close.
-        let ghost: Element<'_, Message> = if let Some(gt) = &self.ghost_task {
-            let title = if gt.title.trim().is_empty() { "Untitled task".to_string() } else { gt.title.clone() };
-            let green = tc.green;
-            let dir_btn = |label: &str, msg: Message| {
-                button(container(text(label.to_string()).size(11).color(tc.text_secondary)).center_x(Fill).padding([3, 0]))
-                    .on_press(msg).style(button::secondary).width(Fill)
-            };
-            let card = container(column![
-                row![
-                    text("＋ NEW SESSION FROM TASK").size(8).color(green),
-                    Space::new().width(Fill),
-                    button(text("✕").size(10).color(tc.text_muted))
-                        .on_press(Message::NotionCloseTask).style(button::text).padding(0),
-                ].align_y(iced::Alignment::Center),
-                text(title).size(14).color(tc.text_primary),
-                row![
-                    dir_btn("📂 Open directory", Message::GhostOpenDir),
-                    dir_btn("＋ Create new directory", Message::GhostNewDir),
-                ].spacing(6),
-            ].spacing(8).padding(12))
-            .style(move |_: &Theme| container::Style {
-                background: Some(Background::Color(c(0x1c, 0x24, 0x1f))),
-                border: Border { color: green, width: 1.0, radius: 8.0.into(), ..Default::default() },
-                ..Default::default()
-            });
-            // slide-down: animate revealed height via max_height + clip
-            let full = 132.0_f32;
-            container(card)
-                .max_height((self.ghost_anim * full).max(0.0))
-                .clip(true)
-                .padding(Padding::from([4, 0]))
-                .into()
-        } else { Space::new().height(0).into() };
-
-        let list = column![ghost, content].spacing(0);
-        column![switcher, header, rule::horizontal(1), scrollable(list).height(Fill)].into()
+        column![switcher, header, rule::horizontal(1), scrollable(content).height(Fill)].into()
     }
 
     fn view_board(&self) -> Element<'_, Message> {
@@ -1762,7 +1726,44 @@ impl App {
             }
         }
 
-        column![header, rule::horizontal(1), scrollable(props_col).height(Fill)].into()
+        // ── Footer: create / reopen a session affiliated with this task ──
+        let green = tc.green;
+        let mut footer = Column::new().spacing(8).padding([12, 18]);
+        // previously-affiliated folders → reopen
+        if let Some(links) = self.task_links.get(&task.id) {
+            if !links.is_empty() {
+                footer = footer.push(text("Affiliated folders").size(11).color(tc.text_muted));
+                for (i, link) in links.iter().enumerate() {
+                    footer = footer.push(
+                        button(row![
+                            text("↻").size(12).color(green),
+                            column![
+                                text(link.session_name.clone()).size(12).color(tc.text_primary),
+                                text(link.path.display().to_string()).size(9).color(tc.text_muted),
+                            ].spacing(1),
+                        ].spacing(8).align_y(iced::Alignment::Center))
+                        .on_press(Message::ReopenTaskLink(i))
+                        .style(button::secondary).padding([6, 10]).width(Fill)
+                    );
+                }
+            }
+        }
+        let action_btn = |label: &str, msg: Message| {
+            button(container(text(label.to_string()).size(12).color(tc.text_primary)).center_x(Fill).padding([5, 0]))
+                .on_press(msg).style(button::secondary).width(Fill)
+        };
+        footer = footer.push(text("New session from this task").size(11).color(tc.text_muted));
+        footer = footer.push(row![
+            action_btn("📂 Open directory", Message::TaskOpenDir),
+            action_btn("＋ Create new directory", Message::TaskNewDir),
+        ].spacing(8));
+
+        column![
+            header, rule::horizontal(1),
+            scrollable(props_col).height(Fill),
+            rule::horizontal(1),
+            footer,
+        ].into()
     }
 
     fn view_terminal(&self) -> Element<'_, Message> {
@@ -2262,10 +2263,6 @@ impl App {
             iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
         ];
-        // Fast ticker only while the ghost card is animating in/out.
-        if self.ghost_closing || (self.ghost_task.is_some() && self.ghost_anim < 1.0) {
-            subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::GhostAnimTick));
-        }
         // Subscribe to every terminal, not just the active one.
         //
         // Why: the terminal's subscription is the only consumer of the bounded
@@ -2406,11 +2403,11 @@ fn message_label(m: &Message) -> &'static str {
         Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
         Message::NotionOpenTask(_) => "NotionOpenTask",
         Message::NotionCloseTask => "NotionCloseTask",
-        Message::GhostOpenDir => "GhostOpenDir",
-        Message::GhostNewDir => "GhostNewDir",
-        Message::GhostDirPicked(_) => "GhostDirPicked",
-        Message::GhostNewParentPicked(_) => "GhostNewParentPicked",
-        Message::GhostAnimTick => "GhostAnimTick",
+        Message::TaskOpenDir => "TaskOpenDir",
+        Message::TaskNewDir => "TaskNewDir",
+        Message::TaskDirPicked(_) => "TaskDirPicked",
+        Message::TaskNewParentPicked(_) => "TaskNewParentPicked",
+        Message::ReopenTaskLink(_) => "ReopenTaskLink",
     }
 }
 

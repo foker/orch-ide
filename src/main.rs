@@ -219,6 +219,9 @@ struct App {
     new_project_parent: Option<PathBuf>, // parent folder for "+" new project flow
     launch_agent: bool,
     agent_backend: AgentBackend,
+    notion_token: String,
+    notion_database_id: Option<String>,
+    notion_group_by_prop: Option<String>,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
@@ -254,6 +257,7 @@ impl Default for App {
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
             launch_agent: true,
             agent_backend: AgentBackend::ClaudeCode,
+            notion_token: String::new(), notion_database_id: None, notion_group_by_prop: None,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -290,6 +294,10 @@ impl App {
             app.dangerously_skip_permissions = state.dangerously_skip_permissions;
             app.quick_prompts = state.quick_prompts;
             app.date_prefix_enabled = state.date_prefix_enabled;
+            app.notion_token = state.notion_token;
+            app.notion_database_id = state.notion_database_id;
+            app.notion_group_by_prop = state.notion_group_by_prop;
+            app.agent_backend = AgentBackend::from_str(&state.agent_backend);
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -388,6 +396,10 @@ impl App {
             dangerously_skip_permissions: self.dangerously_skip_permissions,
             quick_prompts: self.quick_prompts.clone(),
             date_prefix_enabled: self.date_prefix_enabled,
+            notion_token: self.notion_token.clone(),
+            notion_database_id: self.notion_database_id.clone(),
+            notion_group_by_prop: self.notion_group_by_prop.clone(),
+            agent_backend: self.agent_backend.as_str().to_string(),
         });
     }
 

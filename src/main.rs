@@ -143,6 +143,22 @@ fn c(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
+/// Map a Notion option color name to an RGB color (approximating Notion's palette).
+fn notion_color(name: &str) -> Color {
+    match name {
+        "gray" | "grey" => c(0x9b, 0xa1, 0xa6),
+        "brown" => c(0xa6, 0x7c, 0x5b),
+        "orange" => c(0xe8, 0x8a, 0x3d),
+        "yellow" => c(0xd9, 0xb5, 0x3d),
+        "green" => c(0x4d, 0xab, 0x6e),
+        "blue" => c(0x4d, 0x90, 0xcf),
+        "purple" => c(0x9a, 0x6d, 0xd7),
+        "pink" => c(0xd1, 0x5b, 0x9e),
+        "red" => c(0xe0, 0x5b, 0x52),
+        _ => c(0x9b, 0xa1, 0xa6), // default
+    }
+}
+
 #[derive(Clone)]
 struct TC {
     bg_deep: Color, bg_panel: Color, bg_card: Color, bg_card_hover: Color,
@@ -1572,8 +1588,18 @@ impl App {
         let cols = group_tasks(&self.notion_tasks, &gp_id, &options);
         let mut board_row = Row::new().spacing(12).padding(12);
         for (label, tasks) in cols {
+            // column accent color from the matching Notion option (gray for "(none)")
+            let accent = options.iter().find(|o| o.name == label)
+                .map(|o| notion_color(&o.color)).unwrap_or_else(|| c(0x9b, 0xa1, 0xa6));
             let mut col = Column::new().spacing(8).padding(8);
-            col = col.push(text(format!("{}  ({})", label, tasks.len())).size(11).color(tc.text_muted));
+            let header_pill = container(
+                text(format!("{}  {}", label, tasks.len())).size(11).color(c(0x1a, 0x1a, 0x1a))
+            ).padding([2, 8]).style(move |_: &Theme| container::Style {
+                background: Some(Background::Color(accent)),
+                border: Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+            col = col.push(row![header_pill, Space::new().width(Fill)]);
             for t in tasks {
                 let tid = t.id.clone();
                 let card = button(
@@ -2468,6 +2494,7 @@ fn group_tasks<'a>(
         options.iter().map(|o| (o.name.clone(), Vec::new())).collect();
     let mut none_bucket: Vec<&notion::NotionTask> = Vec::new();
     for t in tasks {
+        if t.title.trim().is_empty() { continue; } // hide titleless tasks
         let name = match t.props.get(group_prop_id) {
             Some(notion::PropValue::Select(Some(o))) => Some(o.name.clone()),
             _ => None,

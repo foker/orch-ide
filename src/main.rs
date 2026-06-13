@@ -217,7 +217,8 @@ struct App {
     session_name_input: String,
     show_session_dialog: Option<usize>,
     new_project_parent: Option<PathBuf>, // parent folder for "+" new project flow
-    launch_claude: bool,
+    launch_agent: bool,
+    agent_backend: AgentBackend,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
@@ -251,7 +252,8 @@ impl Default for App {
             projects: Vec::new(), active_project: None, active_session: None,
             file_entries: Vec::new(), terminals: Vec::new(), next_term_id: 0,
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
-            launch_claude: true,
+            launch_agent: true,
+            agent_backend: AgentBackend::ClaudeCode,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -322,23 +324,17 @@ impl App {
         self.next_term_id += 1;
 
         // Determine program and args
-        let skip_flag = if self.dangerously_skip_permissions { " --dangerously-skip-permissions" } else { "" };
-        let (program, args) = if self.launch_claude {
-            let claude_path = which_claude();
-            if resume {
-                let cmd = format!(
-                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
-                    claude_path, skip_flag, claude_path, session_name.replace('\'', "'\\''"), skip_flag
-                );
-                ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
-            } else {
-                let mut a = vec!["--name".to_string(), session_name];
-                if self.dangerously_skip_permissions { a.push("--dangerously-skip-permissions".to_string()); }
-                (claude_path, a)
-            }
-        } else {
-            (std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()), vec![])
-        };
+        let claude_path = which_claude();
+        let opencode_path = which_opencode();
+        let (program, args) = build_agent_command(
+            self.agent_backend,
+            self.launch_agent,
+            resume,
+            &claude_path,
+            &opencode_path,
+            &session_name,
+            self.dangerously_skip_permissions,
+        );
 
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
@@ -372,10 +368,12 @@ impl App {
 
         if let Ok(terminal) = iced_term::Terminal::new(tid, settings) {
             app_log!("  terminal created tid={}", tid);
-            // Setup hooks
-            let sid = &self.projects[pi].sessions[si].id;
-            if let Ok(hp) = hooks::create_hook_script(sid) {
-                let _ = hooks::configure_claude_hooks(&self.projects[pi].path, &hp);
+            // Setup hooks — only for Claude (OpenCode does not emit them)
+            if self.agent_backend == AgentBackend::ClaudeCode && self.launch_agent {
+                let sid = &self.projects[pi].sessions[si].id;
+                if let Ok(hp) = hooks::create_hook_script(sid) {
+                    let _ = hooks::configure_claude_hooks(&self.projects[pi].path, &hp);
+                }
             }
             self.terminals.push(((pi, si), TerminalInstance { terminal, id: tid }));
         }
@@ -427,7 +425,7 @@ impl App {
                         // Auto-open session name dialog with folder name as default
                         self.session_name_input = name;
                         self.show_session_dialog = Some(pi);
-                        self.launch_claude = true;
+                        self.launch_agent = true;
                         self.save_state();
                     }
                 }
@@ -438,11 +436,11 @@ impl App {
                     self.new_project_parent = Some(parent);
                     self.session_name_input = String::new();
                     self.show_session_dialog = Some(usize::MAX);
-                    self.launch_claude = true;
+                    self.launch_agent = true;
                 }
                 iced::widget::operation::focus_next()
             }
-            Message::ToggleLaunchClaude => { self.launch_claude = !self.launch_claude; Task::none() }
+            Message::ToggleLaunchClaude => { self.launch_agent = !self.launch_agent; Task::none() }
             Message::AddSession(pi) => {
                 self.show_session_dialog = Some(pi);
                 iced::widget::operation::focus_next()
@@ -1056,8 +1054,8 @@ impl App {
 
         // New project dialog (when "+" pressed and parent folder selected)
         if self.show_session_dialog == Some(usize::MAX) {
-            let check_color = if self.launch_claude { tc.green } else { tc.text_muted };
-            let check_icon = if self.launch_claude { "☑" } else { "☐" };
+            let check_color = if self.launch_agent { tc.green } else { tc.text_muted };
+            let check_icon = if self.launch_agent { "☑" } else { "☐" };
             let parent_name = self.new_project_parent.as_ref()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
@@ -1279,8 +1277,8 @@ impl App {
 
             // Add session button or inline input
             if self.show_session_dialog == Some(pi) {
-                let check_color = if self.launch_claude { tc.green } else { tc.text_muted };
-                let check_icon = if self.launch_claude { "☑" } else { "☐" };
+                let check_color = if self.launch_agent { tc.green } else { tc.text_muted };
+                let check_icon = if self.launch_agent { "☑" } else { "☐" };
                 content = content.push(
                     container(column![
                         text_input("Session name...", &self.session_name_input)

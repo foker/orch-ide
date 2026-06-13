@@ -235,6 +235,10 @@ enum Message {
     NotionSetGroupBy(String),
     NotionOpenTask(String),
     NotionBodyFetched(String, Result<Vec<notion::Block>, String>),
+    NotionCommentsFetched(String, Result<Vec<notion::Comment>, String>),
+    CommentInput(String),
+    PostComment,
+    CommentPosted(Result<(), String>),
     NotionCloseTask,
     TaskOpenDir,
     TaskNewDir,
@@ -272,6 +276,10 @@ struct App {
     open_task: Option<String>,
     open_task_body: Vec<notion::Block>,
     open_task_body_loading: bool,
+    open_task_comments: Vec<notion::Comment>,
+    comments_loading: bool,
+    comment_input: String,
+    comment_posting: bool,
     task_links: std::collections::HashMap<String, Vec<persistence::TaskLink>>,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
@@ -312,6 +320,7 @@ impl Default for App {
             notion_databases: Vec::new(), notion_schema: None, notion_tasks: Vec::new(),
             notion_error: None, notion_loading: false,
             screen: Screen::Ide, open_task: None, open_task_body: Vec::new(), open_task_body_loading: false,
+            open_task_comments: Vec::new(), comments_loading: false, comment_input: String::new(), comment_posting: false,
             task_links: std::collections::HashMap::new(),
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
@@ -1141,8 +1150,16 @@ impl App {
                 self.open_task = Some(id.clone());
                 self.open_task_body = Vec::new();
                 self.open_task_body_loading = true;
+                self.open_task_comments = Vec::new();
+                self.comments_loading = true;
+                self.comment_input.clear();
                 let tok = self.notion_token.clone();
-                Task::perform(notion::fetch_blocks(tok, id.clone()), move |res| Message::NotionBodyFetched(id.clone(), res))
+                let id_b = id.clone();
+                let id_c = id.clone();
+                Task::batch([
+                    Task::perform(notion::fetch_blocks(tok.clone(), id.clone()), move |res| Message::NotionBodyFetched(id_b.clone(), res)),
+                    Task::perform(notion::fetch_comments(tok, id.clone()), move |res| Message::NotionCommentsFetched(id_c.clone(), res)),
+                ])
             }
             Message::NotionBodyFetched(id, res) => {
                 // ignore stale results for a task that's no longer open
@@ -1155,7 +1172,49 @@ impl App {
                 }
                 Task::none()
             }
-            Message::NotionCloseTask => { self.open_task = None; self.open_task_body = Vec::new(); Task::none() }
+            Message::NotionCommentsFetched(id, res) => {
+                if self.open_task.as_deref() == Some(id.as_str()) {
+                    self.comments_loading = false;
+                    match res {
+                        Ok(cs) => self.open_task_comments = cs,
+                        Err(e) => { self.open_task_comments = Vec::new(); self.notion_error = Some(e); }
+                    }
+                }
+                Task::none()
+            }
+            Message::CommentInput(s) => { self.comment_input = s; Task::none() }
+            Message::PostComment => {
+                let text = self.comment_input.trim().to_string();
+                if text.is_empty() { return Task::none(); }
+                let Some(id) = self.open_task.clone() else { return Task::none(); };
+                self.comment_posting = true;
+                let tok = self.notion_token.clone();
+                Task::perform(notion::create_comment(tok, id, text), Message::CommentPosted)
+            }
+            Message::CommentPosted(res) => {
+                self.comment_posting = false;
+                match res {
+                    Ok(()) => {
+                        self.comment_input.clear();
+                        // refetch comments for the open task
+                        if let Some(id) = self.open_task.clone() {
+                            self.comments_loading = true;
+                            let tok = self.notion_token.clone();
+                            let id_c = id.clone();
+                            return Task::perform(notion::fetch_comments(tok, id), move |res| Message::NotionCommentsFetched(id_c.clone(), res));
+                        }
+                    }
+                    Err(e) => self.notion_error = Some(e),
+                }
+                Task::none()
+            }
+            Message::NotionCloseTask => {
+                self.open_task = None;
+                self.open_task_body = Vec::new();
+                self.open_task_comments = Vec::new();
+                self.comment_input.clear();
+                Task::none()
+            }
             Message::TaskOpenDir => {
                 Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Open directory for this task's session")
@@ -1760,11 +1819,12 @@ impl App {
         }
 
         // ── Body / description (page content blocks) ──
-        let mut body_col = Column::new().spacing(6).padding([8, 18]);
+        let mut body_col = Column::new().spacing(6).padding([8, 24]);
         if self.open_task_body_loading {
             body_col = body_col.push(text("Loading description…").size(11).color(tc.text_muted));
-        } else if !self.open_task_body.is_empty() {
-            body_col = body_col.push(text("DESCRIPTION").size(10).color(tc.text_muted));
+        } else if self.open_task_body.is_empty() {
+            body_col = body_col.push(text("No description.").size(12).color(tc.text_muted));
+        } else {
             for b in &self.open_task_body {
                 let el: Element<'_, Message> = match b.kind.as_str() {
                     "heading_1" => text(b.text.clone()).size(16).color(tc.text_primary).into(),
@@ -1827,9 +1887,45 @@ impl App {
             action_btn("＋ Create new directory", Message::TaskNewDir),
         ].spacing(8));
 
+        // Comments section (under the description, left column)
+        body_col = body_col.push(Space::new().height(16));
+        body_col = body_col.push(rule::horizontal(1));
+        body_col = body_col.push(text(format!("COMMENTS ({})", self.open_task_comments.len())).size(10).color(tc.text_muted));
+        if self.comments_loading {
+            body_col = body_col.push(text("Loading comments…").size(11).color(tc.text_muted));
+        } else if self.open_task_comments.is_empty() {
+            body_col = body_col.push(text("No comments yet.").size(11).color(tc.text_muted));
+        } else {
+            for cm in &self.open_task_comments {
+                let when = cm.created_time.split('T').next().unwrap_or("").to_string();
+                body_col = body_col.push(container(column![
+                    text(cm.text.clone()).size(12).color(tc.text_secondary),
+                    text(when).size(9).color(tc.text_muted),
+                ].spacing(2)).padding([6, 0]));
+            }
+        }
+        body_col = body_col.push(
+            row![
+                text_input("Write a comment…", &self.comment_input)
+                    .on_input(Message::CommentInput)
+                    .on_submit(Message::PostComment)
+                    .size(12).padding(8),
+                button(text(if self.comment_posting { "…" } else { "Send" }).size(11).color(tc.blue))
+                    .on_press(Message::PostComment).style(button::secondary).padding([6, 12]),
+            ].spacing(8).align_y(iced::Alignment::Center)
+        );
+
+        // Two-column body: description (left, main) + properties (right sidebar)
+        let tcp = tc.clone();
+        let body = row![
+            container(scrollable(body_col).height(Fill)).width(Fill).height(Fill),
+            container(scrollable(props_col).height(Fill)).width(360).height(Fill)
+                .style(move |_: &Theme| styled_panel(&tcp)),
+        ].height(Fill);
+
         column![
             header, rule::horizontal(1),
-            scrollable(column![props_col, body_col].spacing(8)).height(Fill),
+            body,
             rule::horizontal(1),
             footer,
         ].into()
@@ -2472,6 +2568,10 @@ fn message_label(m: &Message) -> &'static str {
         Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
         Message::NotionOpenTask(_) => "NotionOpenTask",
         Message::NotionBodyFetched(_, _) => "NotionBodyFetched",
+        Message::NotionCommentsFetched(_, _) => "NotionCommentsFetched",
+        Message::CommentInput(_) => "CommentInput",
+        Message::PostComment => "PostComment",
+        Message::CommentPosted(_) => "CommentPosted",
         Message::NotionCloseTask => "NotionCloseTask",
         Message::TaskOpenDir => "TaskOpenDir",
         Message::TaskNewDir => "TaskNewDir",

@@ -32,6 +32,14 @@ pub struct NotionTask {
     pub props: HashMap<String, PropValue>,
 }
 
+/// A comment on a page.
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub text: String,
+    pub created_time: String,
+    pub author_id: String,
+}
+
 /// A simplified page-content block (the task body / "description").
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -250,6 +258,29 @@ pub async fn fetch_blocks(token: String, page_id: String) -> NotionResult<Vec<Bl
         } else { break; }
     }
     Ok(blocks)
+}
+
+pub fn parse_comments(v: &serde_json::Value) -> Vec<Comment> {
+    v.get("results").and_then(|r| r.as_array()).map(|arr| {
+        arr.iter().map(|c| Comment {
+            text: plain_text(c.get("rich_text").unwrap_or(&serde_json::Value::Null)),
+            created_time: c.get("created_time").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            author_id: c.get("created_by").and_then(|u| u.get("id")).and_then(|i| i.as_str()).unwrap_or("").to_string(),
+        }).collect()
+    }).unwrap_or_default()
+}
+
+pub async fn fetch_comments(token: String, page_id: String) -> NotionResult<Vec<Comment>> {
+    let v = get(&token, &format!("/comments?block_id={page_id}&page_size=100")).await?;
+    Ok(parse_comments(&v))
+}
+
+pub async fn create_comment(token: String, page_id: String, text: String) -> NotionResult<()> {
+    let body = serde_json::json!({
+        "parent": { "page_id": page_id },
+        "rich_text": [ { "text": { "content": text } } ]
+    });
+    post(&token, "/comments", body).await.map(|_| ())
 }
 
 pub async fn query_tasks(token: String, db_id: String, props: Vec<NotionProp>) -> NotionResult<Vec<NotionTask>> {

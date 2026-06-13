@@ -1,4 +1,4 @@
-use crate::session::ProjectGroup;
+use crate::session::{PipelineDef, ProjectGroup};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,6 +16,8 @@ pub struct AppState {
     pub quick_prompts: Vec<String>,
     #[serde(default = "default_true")]
     pub date_prefix_enabled: bool,
+    #[serde(default)]
+    pub pipelines: Vec<PipelineDef>,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }

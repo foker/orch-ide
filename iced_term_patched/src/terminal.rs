@@ -37,6 +37,12 @@ pub struct Terminal {
     pub(crate) bindings: BindingsLayout,
     pub(crate) backend: backend::Backend,
     backend_event_rx: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    /// Last time `sync_and_redraw` actually ran. Used to throttle PTY-driven
+    /// syncs to ~60 fps so a burst of alacritty events does not trigger a
+    /// 16-20 MB grid clone per chunk (multiplied by 30+/s during big output
+    /// streams it was burning hundreds of MB/s of memory bandwidth and lagging
+    /// the whole machine).
+    last_sync_at: Option<std::time::Instant>,
 }
 
 impl Terminal {
@@ -58,6 +64,7 @@ impl Terminal {
                 settings.backend,
             )?,
             backend_event_rx: Arc::new(Mutex::new(backend_event_rx)),
+            last_sync_at: None,
         })
     }
 
@@ -77,6 +84,27 @@ impl Terminal {
     pub fn handle(&mut self, cmd: Command) -> Action {
         let mut action = Action::default();
 
+        // Decide what kind of post-handle sync this command needs.
+        //   - Theme / Font change: full sync (font re-shape + grid clone +
+        //     redraw), bypass throttle so settings show up immediately.
+        //   - ProxyToBackend(ProcessAlacrittyEvent): throttled. This is the
+        //     burst-frequency path — alacritty fires Wakeup on every PTY chunk
+        //     during a streaming claude output and a full grid clone (~4 MB
+        //     even at the reduced 2K scrollback) per chunk saturates RAM
+        //     bandwidth. Coalesce to 60 fps.
+        //   - Anything else (user Write / Scroll / Resize / Select / Bindings):
+        //     immediate sync, NO throttle. Otherwise user input lands in the
+        //     16 ms throttle window and the keystroke is invisible until the
+        //     next event fires — that was the "I typed ABCD, only ABC shows
+        //     up, then E appears as DE" bug.
+        enum SyncKind { FullForce, Throttled, Immediate }
+        let sync_kind = match &cmd {
+            Command::ChangeTheme(_) | Command::ChangeFont(_) => SyncKind::FullForce,
+            Command::ProxyToBackend(backend::Command::ProcessAlacrittyEvent(_)) =>
+                SyncKind::Throttled,
+            _ => SyncKind::Immediate,
+        };
+
         match cmd {
             Command::ChangeTheme(color_pallete) => {
                 self.theme = Theme::new(ThemeSettings::new(color_pallete));
@@ -92,12 +120,43 @@ impl Terminal {
             },
         };
 
-        self.sync_and_redraw();
+        match sync_kind {
+            SyncKind::FullForce => {
+                self.sync_font();
+                self.backend.sync();
+                self.redraw();
+                self.last_sync_at = Some(std::time::Instant::now());
+            },
+            SyncKind::Immediate => {
+                self.backend.sync();
+                self.redraw();
+                self.last_sync_at = Some(std::time::Instant::now());
+            },
+            SyncKind::Throttled => {
+                self.throttled_sync_and_redraw();
+            },
+        }
         action
     }
 
-    fn sync_and_redraw(&mut self) {
-        self.sync_font();
+    /// Throttle grid-sync + canvas-redraw to ~60 fps. Each `backend.sync()`
+    /// clones the full alacritty Grid (~20 MB at 10K scrollback); calling it
+    /// 100-300 times per second during a claude streaming burst was the main
+    /// cause of system-wide lag (RAM bandwidth saturation + lock contention
+    /// with alacritty's PTY EventLoop). Skipping when <16 ms passed since the
+    /// last sync coalesces bursts into one redraw per frame. Trailing events
+    /// in a burst still get rendered: the next event after the throttle
+    /// window will sync.
+    fn throttled_sync_and_redraw(&mut self) {
+        const MIN_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(16);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_sync_at {
+            if now.duration_since(last) < MIN_INTERVAL {
+                return;
+            }
+        }
+        self.last_sync_at = Some(now);
         self.backend.sync();
         self.redraw();
     }
@@ -137,20 +196,31 @@ fn terminal_subscription_stream(
             match event_receiver.recv().await {
                 Some(event) => {
                     if let AlacrittyEvent::Exit = event {
-                        shutdown = true
-                    };
+                        shutdown = true;
+                    }
 
-                    output
+                    if output
                         .send(Event::BackendCall(id, backend::Command::ProcessAlacrittyEvent(event)))
                         .await
-                        .unwrap_or_else(|_| {
-                            panic!("iced_term stream {}: sending BackendEventReceived event is failed", id)
-                        });
+                        .is_err()
+                    {
+                        // Subscriber went away (app shutting down / terminal dropped).
+                        // Exit the loop instead of panicking — drops the receiver lock
+                        // so the backend mutex can be cleaned up.
+                        eprintln!("iced_term stream {}: subscriber gone, exiting", id);
+                        break;
+                    }
                 },
                 None => {
+                    // Channel closed. Always break (whether shutdown was signalled or
+                    // not) — looping on None is a busy-loop that holds the receiver
+                    // lock forever and was a deadlock source. Panicking on
+                    // unexpected-close also took the whole tokio worker down and left
+                    // dangling backend state, causing the UI-thread mutex deadlock.
                     if !shutdown {
-                        panic!("iced_term stream {}: terminal event channel closed unexpected", id);
+                        eprintln!("iced_term stream {}: terminal event channel closed unexpected", id);
                     }
+                    break;
                 },
             }
         }

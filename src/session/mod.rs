@@ -71,6 +71,68 @@ pub struct Session {
     pub status_changed_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub color: SessionColor,
+    #[serde(default)]
+    pub pipeline_run: Option<PipelineRun>,
+    /// Set by Tick from the Stop hook payload. Pipeline driver gates auto-advance
+    /// on this — claude ending its last turn with `?` means it's asking the user
+    /// something, not finishing work.
+    #[serde(skip, default)]
+    pub last_was_question: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PipelineStep {
+    pub prompt: String,
+    #[serde(default)]
+    pub interactive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PipelineDef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub steps: Vec<PipelineStep>,
+    /// Prepended to every step's prompt. `{requirements}` is replaced with the
+    /// absolute path to the project's `.orchpipeline` file at run time.
+    #[serde(default = "default_prepend_template")]
+    pub prepend_template: String,
+}
+
+pub fn default_prepend_template() -> String {
+    "The main requirements content is in this file: {requirements}".to_string()
+}
+
+impl PipelineDef {
+    pub fn new(name: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
+            name,
+            steps: Vec::new(),
+            prepend_template: default_prepend_template(),
+        }
+    }
+}
+
+/// Live pipeline run tied to a Session. Persisted across restarts; transient
+/// fields (last_seen_running / prompt_pending_send / send_delay_ticks) are reset
+/// on load since the underlying PTY dies with the app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineRun {
+    pub pipeline_name: String,
+    pub steps: Vec<PipelineStep>,
+    pub current_step: usize,
+    pub requirements_path: PathBuf,
+    /// Snapshot of the pipeline's prepend template at run start — keeps the run
+    /// stable even if the user edits the pipeline definition mid-run.
+    #[serde(default = "default_prepend_template")]
+    pub prepend_template: String,
+    #[serde(skip, default)]
+    pub last_seen_running: bool,
+    #[serde(skip, default)]
+    pub prompt_pending_send: bool,
+    #[serde(skip, default)]
+    pub send_delay_ticks: u8,
 }
 
 impl Session {
@@ -85,6 +147,8 @@ impl Session {
             created_at: now,
             status_changed_at: now,
             color: SessionColor::Grey,
+            pipeline_run: None,
+            last_was_question: false,
         }
     }
 

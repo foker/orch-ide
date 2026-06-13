@@ -9,7 +9,7 @@ mod voice;
 
 use iced::widget::{
     button, column, container, row, scrollable, text,
-    text_input, mouse_area, Column, Row, Space, rule,
+    text_input, mouse_area, pick_list, Column, Row, Space, rule,
 };
 use iced::{Element, Fill, Font, Padding, Subscription, Theme, Color, Border, Background, Task};
 use session::{ProjectGroup, Session, SessionStatus};
@@ -1515,31 +1515,45 @@ impl App {
             seg("IDE", Screen::Ide), seg("Board", Screen::Board),
         ].spacing(4)).padding([8, 10]);
 
-        // Ghost card — new session from the currently-open Notion task
+        // Ghost card — new session from the currently-open Notion task.
+        // Styled like a real session card with a green accent to read as "add".
         let ghost: Element<'_, Message> = if let Some(gt) = &self.ghost_task {
-            let mut proj_picker = Row::new().spacing(4);
-            for (pi, p) in self.projects.iter().enumerate() {
-                let active = self.ghost_target_project == Some(pi)
-                    || (self.ghost_target_project.is_none() && self.active_project == Some(pi));
-                proj_picker = proj_picker.push(
-                    button(text(p.name.clone()).size(9).color(if active { tc.text_primary } else { tc.text_muted }))
-                        .on_press(Message::GhostSetProject(pi))
-                        .style(if active { button::secondary } else { button::text }).padding([2,6])
-                );
-            }
-            let tcg = tc.clone();
+            let names: Vec<String> = self.projects.iter().map(|p| p.name.clone()).collect();
+            let selected = self.ghost_target_project.or(self.active_project)
+                .and_then(|i| self.projects.get(i)).map(|p| p.name.clone());
+            let names_for_closure = names.clone();
+            let picker: Element<'_, Message> = if names.is_empty() {
+                text("open a project first").size(10).color(tc.text_muted).into()
+            } else {
+                pick_list(names, selected, move |sel| {
+                    Message::GhostSetProject(names_for_closure.iter().position(|n| *n == sel).unwrap_or(0))
+                }).text_size(11).padding([3, 8]).width(Fill).into()
+            };
+            let title = if gt.title.trim().is_empty() { "Untitled task".to_string() } else { gt.title.clone() };
+            let green = tc.green;
             container(column![
-                text("NEW SESSION FROM TASK").size(8).color(tc.text_muted),
-                text(gt.title.clone()).size(12).color(tc.text_primary),
-                scrollable(proj_picker).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())),
-                button(text("＋ Create session").size(11).color(tc.green))
-                    .on_press(Message::CreateSessionFromTask).style(button::text).padding([2,0]),
-            ].spacing(6).padding(10))
+                row![
+                    text("＋ NEW SESSION FROM TASK").size(8).color(green),
+                    Space::new().width(Fill),
+                    button(text("✕").size(10).color(tc.text_muted))
+                        .on_press(Message::NotionCloseTask).style(button::text).padding(0),
+                ].align_y(iced::Alignment::Center),
+                text(title).size(13).color(tc.text_primary),
+                row![
+                    text("in").size(10).color(tc.text_muted),
+                    picker,
+                ].spacing(6).align_y(iced::Alignment::Center),
+                button(container(text("Create session").size(11).color(green)).center_x(Fill).padding([4, 0]))
+                    .on_press(Message::CreateSessionFromTask)
+                    .style(button::text).width(Fill),
+            ].spacing(8).padding(12))
             .style(move |_: &Theme| container::Style {
-                border: Border { color: tcg.border_active, width: 1.0, radius: 6.0.into(), ..Default::default() },
-                ..styled_panel(&tcg)
+                background: Some(Background::Color(c(0x1c, 0x24, 0x1f))),
+                border: Border { color: green, width: 1.0, radius: 8.0.into(), ..Default::default() },
+                ..Default::default()
             }).into()
         } else { Space::new().height(0).into() };
+        let ghost = container(ghost).padding(if self.ghost_task.is_some() { Padding::from([6, 8]) } else { Padding::from(0) });
 
         column![switcher, ghost, header, rule::horizontal(1), scrollable(content).height(Fill)].into()
     }

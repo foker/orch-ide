@@ -381,14 +381,22 @@ impl App {
         for pi in 0..app.projects.len() {
             let path = app.projects[pi].path.clone();
             boot_tasks.push(Task::perform(
-                async move { git_info::get_git_info_with_pr(&path) },
+                // spawn_blocking: get_git_info_with_pr shells out to git/gh (blocking).
+                // Running it directly on the async executor starves every other
+                // boot task (incl. the Notion schema fetch) for tens of seconds.
+                async move {
+                    tokio::task::spawn_blocking(move || git_info::get_git_info_with_pr(&path))
+                        .await.ok().flatten()
+                },
                 move |info| Message::GitInfoFetched(pi, info),
             ));
         }
         // Auto-load the Notion board when token + db are persisted
+        app_log!("boot notion: token_empty={} db_id={:?}", app.notion_token.is_empty(), app.notion_database_id);
         if !app.notion_token.is_empty() {
             if let Some(db_id) = app.notion_database_id.clone() {
                 let tok = app.notion_token.clone();
+                app_log!("boot notion: firing fetch_schema for {}", db_id);
                 boot_tasks.push(Task::perform(notion::fetch_schema(tok, db_id), Message::NotionSchemaFetched));
             }
         }
@@ -803,7 +811,10 @@ impl App {
                 self.refresh_pending_git.insert(pi);
                 let path = self.projects[pi].path.clone();
                 Task::perform(
-                    async move { git_info::get_git_info_with_pr(&path) },
+                    async move {
+                        tokio::task::spawn_blocking(move || git_info::get_git_info_with_pr(&path))
+                            .await.ok().flatten()
+                    },
                     move |info| Message::GitInfoFetched(pi, info),
                 )
             }
@@ -842,14 +853,16 @@ impl App {
                 app_log!("FetchDeployments: pi={} repos={}", pi, sub_repos.len());
                 Task::perform(
                     async move {
-                        let mut results = Vec::new();
-                        for (name, path) in sub_repos {
-                            let deps = git_info::get_deployments(&path);
-                            if !deps.is_empty() {
-                                results.push((name, deps));
+                        tokio::task::spawn_blocking(move || {
+                            let mut results = Vec::new();
+                            for (name, path) in sub_repos {
+                                let deps = git_info::get_deployments(&path);
+                                if !deps.is_empty() {
+                                    results.push((name, deps));
+                                }
                             }
-                        }
-                        (pi, results)
+                            (pi, results)
+                        }).await.unwrap_or((pi, Vec::new()))
                     },
                     |(pi, deps)| Message::DeploymentsFetched(pi, deps),
                 )

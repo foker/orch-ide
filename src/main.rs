@@ -1,4 +1,5 @@
 mod session;
+mod notion;
 mod explorer;
 mod git_info;
 mod hooks;

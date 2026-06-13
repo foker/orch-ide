@@ -270,6 +270,29 @@ pub fn parse_comments(v: &serde_json::Value) -> Vec<Comment> {
     }).unwrap_or_default()
 }
 
+/// Create a new page (task) in the database. `title_prop` is the title
+/// property name; `group` is the (property name, kind "status"|"select", value)
+/// to set so the task lands in the right board column (None for "(none)").
+pub async fn create_task(
+    token: String,
+    db_id: String,
+    title_prop: String,
+    title: String,
+    group: Option<(String, String, String)>,
+) -> NotionResult<()> {
+    let mut props = serde_json::json!({
+        title_prop: { "title": [ { "text": { "content": title } } ] }
+    });
+    if let Some((name, kind, value)) = group {
+        props[name] = serde_json::json!({ kind: { "name": value } });
+    }
+    let body = serde_json::json!({
+        "parent": { "database_id": db_id },
+        "properties": props
+    });
+    post(&token, "/pages", body).await.map(|_| ())
+}
+
 pub async fn fetch_comments(token: String, page_id: String) -> NotionResult<Vec<Comment>> {
     let v = get(&token, &format!("/comments?block_id={page_id}&page_size=100")).await?;
     Ok(parse_comments(&v))

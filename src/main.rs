@@ -254,6 +254,11 @@ enum Message {
     NotionTasksFetched(Result<Vec<notion::NotionTask>, String>),
     NotionRefresh,
     NotionSetGroupBy(String),
+    BoardAddTaskStart(String),
+    BoardAddTaskInput(String),
+    BoardAddTaskSubmit,
+    BoardAddTaskCancel,
+    BoardTaskCreated(Result<(), String>),
     NotionOpenTask(String),
     OpenTaskBoard(String),
     NotionBodyFetched(String, Result<Vec<notion::Block>, String>),
@@ -294,6 +299,9 @@ struct App {
     notion_tasks: Vec<notion::NotionTask>,
     notion_error: Option<String>,
     notion_loading: bool,
+    adding_task_col: Option<String>,
+    new_task_title: String,
+    creating_task: bool,
     screen: Screen,
     open_task: Option<String>,
     open_task_body: Vec<notion::Block>,
@@ -341,6 +349,7 @@ impl Default for App {
             notion_token: String::new(), notion_database_id: None, notion_group_by_prop: None,
             notion_databases: Vec::new(), notion_schema: None, notion_tasks: Vec::new(),
             notion_error: None, notion_loading: false,
+            adding_task_col: None, new_task_title: String::new(), creating_task: false,
             screen: Screen::Ide, open_task: None, open_task_body: Vec::new(), open_task_body_loading: false,
             open_task_comments: Vec::new(), comments_loading: false, comment_input: String::new(), comment_posting: false,
             task_links: std::collections::HashMap::new(),
@@ -1183,6 +1192,55 @@ impl App {
                 Task::none()
             }
             Message::NotionSetGroupBy(pid) => { self.notion_group_by_prop = Some(pid); self.save_state(); Task::none() }
+            Message::BoardAddTaskStart(col) => {
+                self.adding_task_col = Some(col);
+                self.new_task_title.clear();
+                Task::none()
+            }
+            Message::BoardAddTaskInput(s) => { self.new_task_title = s; Task::none() }
+            Message::BoardAddTaskCancel => { self.adding_task_col = None; self.new_task_title.clear(); Task::none() }
+            Message::BoardAddTaskSubmit => {
+                let title = self.new_task_title.trim().to_string();
+                let (Some(col), Some(schema), Some(db_id)) =
+                    (self.adding_task_col.clone(), self.notion_schema.clone(), self.notion_database_id.clone())
+                    else { return Task::none(); };
+                if title.is_empty() { return Task::none(); }
+                let title_prop = match schema.props.iter().find(|p| matches!(p.kind, notion::PropKind::Title)) {
+                    Some(p) => p.name.clone(),
+                    None => { self.notion_error = Some("No title property in database".into()); return Task::none(); }
+                };
+                // group value for the target column (None for the "(none)" bucket)
+                let gp_id = self.notion_group_by_prop.clone().unwrap_or_default();
+                let group = schema.props.iter().find(|p| p.id == gp_id).and_then(|p| {
+                    let kind = match p.kind {
+                        notion::PropKind::Status(_) => "status",
+                        notion::PropKind::Select(_) => "select",
+                        _ => return None,
+                    };
+                    if col == "(none)" { None } else { Some((p.name.clone(), kind.to_string(), col.clone())) }
+                });
+                self.creating_task = true;
+                self.notion_error = None;
+                let tok = self.notion_token.clone();
+                Task::perform(notion::create_task(tok, db_id, title_prop, title, group), Message::BoardTaskCreated)
+            }
+            Message::BoardTaskCreated(res) => {
+                self.creating_task = false;
+                match res {
+                    Ok(()) => {
+                        self.adding_task_col = None;
+                        self.new_task_title.clear();
+                        // refetch tasks to show the new card
+                        if let Some(db) = self.notion_schema.clone() {
+                            let tok = self.notion_token.clone();
+                            self.notion_loading = true;
+                            return Task::perform(notion::query_tasks(tok, db.id.clone(), db.props.clone()), Message::NotionTasksFetched);
+                        }
+                    }
+                    Err(e) => self.notion_error = Some(e),
+                }
+                Task::none()
+            }
             Message::OpenTaskBoard(id) => {
                 self.screen = Screen::Board;
                 return self.update(Message::NotionOpenTask(id));
@@ -1625,59 +1683,77 @@ impl App {
                 let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
                 let hover_bg = t.bg_card_hover;
 
-                // Card row: [card button] [kill button]
-                let card_row = row![
-                    button({
-                        let mut card_col = Column::new().spacing(6);
-                        card_col = card_col.push(top);
-                        card_col = card_col.push(meta);
-                        // Color picker when renaming
-                        if self.renaming_session == Some((pi, si)) {
-                            let mut color_row = Row::new().spacing(4);
-                            for &clr in session::SessionColor::all() {
-                                let (r, g, b) = clr.to_rgb();
-                                let is_selected = session.color == clr;
-                                let dot_size = if is_selected { 12 } else { 10 };
-                                color_row = color_row.push(
-                                    button(text("●").size(dot_size).color(c(r, g, b)))
-                                        .on_press(Message::SetSessionColor(pi, si, clr))
-                                        .style(button::text).padding([1, 2])
-                                );
-                            }
-                            card_col = card_col.push(color_row);
+                // Card content (left, fills) — a transparent button for "select"
+                let select_btn = button({
+                    let mut card_col = Column::new().spacing(6);
+                    card_col = card_col.push(top);
+                    card_col = card_col.push(meta);
+                    // Color picker when renaming
+                    if self.renaming_session == Some((pi, si)) {
+                        let mut color_row = Row::new().spacing(4);
+                        for &clr in session::SessionColor::all() {
+                            let (r, g, b) = clr.to_rgb();
+                            let is_selected = session.color == clr;
+                            let dot_size = if is_selected { 12 } else { 10 };
+                            color_row = color_row.push(
+                                button(text("●").size(dot_size).color(c(r, g, b)))
+                                    .on_press(Message::SetSessionColor(pi, si, clr))
+                                    .style(button::text).padding([1, 2])
+                            );
                         }
-                        card_col
+                        card_col = card_col.push(color_row);
+                    }
+                    card_col
+                })
+                    .on_press(Message::SelectSession(pi, si))
+                    .style(move |_: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered | button::Status::Pressed => hover_bg,
+                            _ => Color::TRANSPARENT,
+                        };
+                        button::Style {
+                            background: Some(Background::Color(bg)),
+                            text_color: Color::WHITE,
+                            ..Default::default()
+                        }
                     })
-                        .on_press(Message::SelectSession(pi, si))
-                        .style(move |_: &Theme, status: button::Status| {
-                            let bg = match status {
-                                button::Status::Hovered | button::Status::Pressed => hover_bg,
-                                _ => bg_c,
-                            };
-                            button::Style {
-                                background: Some(Background::Color(bg)),
-                                border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
-                                text_color: Color::WHITE,
-                                ..Default::default()
-                            }
-                        })
-                        .padding([10, 12])
-                        .width(Fill),
-                    column![
-                        tip(button(text("✕").size(11).color(tc.text_muted))
-                                .on_press(Message::KillSession(pi, si))
-                                .style(button::text).padding([4, 6]),
-                            "Kill session"),
-                        tip(button(text("◼").size(9).color(tc.text_muted))
-                                .on_press(Message::MakeIdle(pi, si))
-                                .style(button::text).padding([4, 6]),
-                            "Set idle"),
-                        tip(button(text("🗑").size(9))
-                                .on_press(Message::DeleteProjectDir(pi))
-                                .style(button::text).padding([4, 6]),
-                            "Delete folder"),
-                    ].spacing(0),
-                ].align_y(iced::Alignment::Start);
+                    .padding([10, 12])
+                    .width(Fill);
+
+                // Faint vertical separator between content and action buttons
+                let sep_color = Color { a: 0.12, ..session_border_color };
+                let separator = container(Space::new().width(1).height(Fill))
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(sep_color)),
+                        ..Default::default()
+                    });
+
+                // Action buttons (right, inside the card)
+                let actions = container(column![
+                    tip(button(text("✕").size(11).color(tc.text_muted))
+                            .on_press(Message::KillSession(pi, si))
+                            .style(button::text).padding([4, 6]),
+                        "Kill session"),
+                    tip(button(text("◼").size(9).color(tc.text_muted))
+                            .on_press(Message::MakeIdle(pi, si))
+                            .style(button::text).padding([4, 6]),
+                        "Set idle"),
+                    tip(button(text("🗑").size(9))
+                            .on_press(Message::DeleteProjectDir(pi))
+                            .style(button::text).padding([4, 6]),
+                        "Delete folder"),
+                ].spacing(0)).padding([4, 2]);
+
+                // Whole card: bordered container holding [content | sep | actions]
+                let card_row = container(
+                    row![select_btn, separator, actions].align_y(iced::Alignment::Center)
+                )
+                .style(move |_: &Theme| container::Style {
+                    background: Some(Background::Color(bg_c)),
+                    border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .width(Fill);
 
                 content = content.push(
                     mouse_area(
@@ -1802,7 +1878,32 @@ impl App {
                 border: Border { radius: 4.0.into(), ..Default::default() },
                 ..Default::default()
             });
-            col = col.push(row![header_pill, Space::new().width(Fill)]);
+            let add_label = label.clone();
+            col = col.push(row![
+                header_pill,
+                Space::new().width(Fill),
+                tip(button(text("+").size(14).color(tc.text_muted))
+                        .on_press(Message::BoardAddTaskStart(add_label))
+                        .style(button::text).padding([0, 4]),
+                    "Add task to this column"),
+            ].align_y(iced::Alignment::Center));
+            // inline new-task input for this column
+            if self.adding_task_col.as_deref() == Some(label.as_str()) {
+                col = col.push(
+                    column![
+                        text_input("New task title…", &self.new_task_title)
+                            .on_input(Message::BoardAddTaskInput)
+                            .on_submit(Message::BoardAddTaskSubmit)
+                            .size(12).padding(6),
+                        row![
+                            button(text(if self.creating_task { "Adding…" } else { "Add" }).size(11).color(tc.green))
+                                .on_press(Message::BoardAddTaskSubmit).style(button::text).padding([2, 6]),
+                            button(text("Cancel").size(11).color(tc.text_muted))
+                                .on_press(Message::BoardAddTaskCancel).style(button::text).padding([2, 6]),
+                        ].spacing(4),
+                    ].spacing(4)
+                );
+            }
             for t in tasks {
                 let tid = t.id.clone();
                 let card = button(
@@ -2642,6 +2743,11 @@ fn message_label(m: &Message) -> &'static str {
         Message::NotionTasksFetched(_) => "NotionTasksFetched",
         Message::NotionRefresh => "NotionRefresh",
         Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
+        Message::BoardAddTaskStart(_) => "BoardAddTaskStart",
+        Message::BoardAddTaskInput(_) => "BoardAddTaskInput",
+        Message::BoardAddTaskSubmit => "BoardAddTaskSubmit",
+        Message::BoardAddTaskCancel => "BoardAddTaskCancel",
+        Message::BoardTaskCreated(_) => "BoardTaskCreated",
         Message::NotionOpenTask(_) => "NotionOpenTask",
         Message::OpenTaskBoard(_) => "OpenTaskBoard",
         Message::NotionBodyFetched(_, _) => "NotionBodyFetched",

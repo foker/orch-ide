@@ -585,6 +585,10 @@ impl App {
                 let has_term = self.terminals.iter().any(|(k, _)| *k == (pi, si));
                 if !has_term {
                     self.spawn_session_terminal(pi, si, true);
+                } else if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    // It was handled quietly while in the background — refresh its
+                    // rendered grid now that it's the focused terminal.
+                    ti.terminal.sync();
                 }
                 // Fetch git info + deployments async (non-blocking)
                 let git_task = self.update(Message::FetchGitInfo(pi));
@@ -1048,8 +1052,20 @@ impl App {
             Message::TermEvent(event) => {
                 match event {
                     iced_term::Event::BackendCall(id, cmd) => {
-                        if let Some((_, ti)) = self.terminals.iter_mut().find(|(_, t)| t.id == id) {
-                            ti.terminal.handle(iced_term::Command::ProxyToBackend(cmd));
+                        // Only the focused, on-screen terminal does the heavy grid
+                        // sync + GPU redraw. Every other terminal is still drained
+                        // (the subscription consumes the channel) and kept PTY-
+                        // responsive via handle_quiet, but skips sync/redraw — this
+                        // is the main battery/heat win when background sessions run
+                        // animated TUIs that flood output.
+                        let active_key = self.active_session;
+                        let on_ide = self.screen == Screen::Ide;
+                        if let Some((key, ti)) = self.terminals.iter_mut().find(|(_, t)| t.id == id) {
+                            if on_ide && Some(*key) == active_key {
+                                ti.terminal.handle(iced_term::Command::ProxyToBackend(cmd));
+                            } else {
+                                ti.terminal.handle_quiet(iced_term::Command::ProxyToBackend(cmd));
+                            }
                         }
                     }
                 }

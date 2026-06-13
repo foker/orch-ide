@@ -74,9 +74,8 @@ impl Terminal {
         Subscription::run_with(data, terminal_subscription_stream)
     }
 
-    pub fn handle(&mut self, cmd: Command) -> Action {
+    fn apply(&mut self, cmd: Command) -> Action {
         let mut action = Action::default();
-
         match cmd {
             Command::ChangeTheme(color_pallete) => {
                 self.theme = Theme::new(ThemeSettings::new(color_pallete));
@@ -91,9 +90,28 @@ impl Terminal {
                 action = self.backend.handle(cmd);
             },
         };
+        action
+    }
 
+    pub fn handle(&mut self, cmd: Command) -> Action {
+        let action = self.apply(cmd);
         self.sync_and_redraw();
         action
+    }
+
+    /// Apply a command WITHOUT syncing the render grid or clearing the draw
+    /// cache. Used for background (non-focused) terminals: it keeps the PTY
+    /// responsive (PtyWrite/Exit are still processed) and drains the event,
+    /// but avoids the expensive grid sync + GPU redraw. Call `sync()` when the
+    /// terminal becomes visible again to refresh its rendered content.
+    pub fn handle_quiet(&mut self, cmd: Command) -> Action {
+        self.apply(cmd)
+    }
+
+    /// Force a render-grid sync + redraw (e.g. when a background terminal is
+    /// brought to the foreground after being handled quietly).
+    pub fn sync(&mut self) {
+        self.sync_and_redraw();
     }
 
     fn sync_and_redraw(&mut self) {

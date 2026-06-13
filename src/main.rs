@@ -34,6 +34,21 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppTheme { Midnight, VsCode, Darcula, GitHub, Monokai, Catppuccin }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBackend { ClaudeCode, OpenCode }
+
+impl AgentBackend {
+    fn label(&self) -> &'static str {
+        match self { AgentBackend::ClaudeCode => "Claude Code", AgentBackend::OpenCode => "OpenCode" }
+    }
+    fn from_str(s: &str) -> Self {
+        match s { "OpenCode" => AgentBackend::OpenCode, _ => AgentBackend::ClaudeCode }
+    }
+    fn as_str(&self) -> &'static str {
+        match self { AgentBackend::ClaudeCode => "ClaudeCode", AgentBackend::OpenCode => "OpenCode" }
+    }
+}
+
 impl AppTheme {
     fn all() -> &'static [AppTheme] {
         &[AppTheme::Midnight, AppTheme::VsCode, AppTheme::Darcula, AppTheme::GitHub, AppTheme::Monokai, AppTheme::Catppuccin]
@@ -1981,4 +1996,106 @@ fn chip<'a>(label: &str, color: Color) -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// Pure decision: given backend + flags, return (program, args) for the terminal.
+/// `launch_agent` false => plain login shell. Resume only meaningful for Claude.
+fn build_agent_command(
+    backend: AgentBackend,
+    launch_agent: bool,
+    resume: bool,
+    claude_path: &str,
+    opencode_path: &str,
+    session_name: &str,
+    skip_perms: bool,
+) -> (String, Vec<String>) {
+    if !launch_agent {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        return (sh, vec![]);
+    }
+    match backend {
+        AgentBackend::OpenCode => (opencode_path.to_string(), vec![]),
+        AgentBackend::ClaudeCode => {
+            let skip_flag = if skip_perms { " --dangerously-skip-permissions" } else { "" };
+            if resume {
+                let cmd = format!(
+                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
+                    claude_path, skip_flag, claude_path,
+                    session_name.replace('\'', "'\\''"), skip_flag
+                );
+                ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
+            } else {
+                let mut a = vec!["--name".to_string(), session_name.to_string()];
+                if skip_perms { a.push("--dangerously-skip-permissions".to_string()); }
+                (claude_path.to_string(), a)
+            }
+        }
+    }
+}
+
+/// Find opencode binary path (mirrors which_claude).
+fn which_opencode() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
+        .args(["-lc", "which opencode"]).output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() { return p; }
+        }
+    }
+    let fallbacks = [
+        dirs::home_dir().map(|h| h.join(".opencode/bin/opencode").to_string_lossy().to_string()),
+        Some("/usr/local/bin/opencode".to_string()),
+        Some("/opt/homebrew/bin/opencode".to_string()),
+    ];
+    for f in fallbacks.into_iter().flatten() {
+        if std::path::Path::new(&f).exists() { return f; }
+    }
+    "opencode".to_string()
+}
+
+#[cfg(test)]
+mod agent_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn claude_fresh_uses_name_flag() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::ClaudeCode, true, false,
+            "/bin/claude", "/bin/opencode", "my task", true,
+        );
+        assert_eq!(prog, "/bin/claude");
+        assert_eq!(args, vec!["--name", "my task", "--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn claude_resume_uses_continue_shell() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::ClaudeCode, true, true,
+            "/bin/claude", "/bin/opencode", "my task", false,
+        );
+        assert_eq!(prog, "/bin/sh");
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("--continue"));
+    }
+
+    #[test]
+    fn opencode_runs_bare_in_cwd() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::OpenCode, true, false,
+            "/bin/claude", "/bin/opencode", "my task", true,
+        );
+        assert_eq!(prog, "/bin/opencode");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn plain_shell_when_agent_off() {
+        let (prog, _args) = build_agent_command(
+            AgentBackend::ClaudeCode, false, false,
+            "/bin/claude", "/bin/opencode", "x", true,
+        );
+        assert!(prog.ends_with("sh") || prog.ends_with("zsh") || prog.contains("/"));
+    }
 }

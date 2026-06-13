@@ -1,4 +1,5 @@
 mod session;
+mod notion;
 mod explorer;
 mod git_info;
 mod hooks;
@@ -33,6 +34,24 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppTheme { Midnight, VsCode, Darcula, GitHub, Monokai, Catppuccin }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen { Ide, Board }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBackend { ClaudeCode, OpenCode }
+
+impl AgentBackend {
+    fn label(&self) -> &'static str {
+        match self { AgentBackend::ClaudeCode => "Claude Code", AgentBackend::OpenCode => "OpenCode" }
+    }
+    fn from_str(s: &str) -> Self {
+        match s { "OpenCode" => AgentBackend::OpenCode, _ => AgentBackend::ClaudeCode }
+    }
+    fn as_str(&self) -> &'static str {
+        match self { AgentBackend::ClaudeCode => "ClaudeCode", AgentBackend::OpenCode => "OpenCode" }
+    }
+}
 
 impl AppTheme {
     fn all() -> &'static [AppTheme] {
@@ -186,6 +205,22 @@ enum Message {
     KeyboardEvent(iced::keyboard::Event),
     ToggleSettings, SetTheme(AppTheme),
     TermEvent(iced_term::Event),
+    // Agent backend + screen
+    SetAgentBackend(AgentBackend),
+    SetScreen(Screen),
+    // Notion
+    NotionTokenChanged(String),
+    NotionConnect,
+    NotionDatabasesFetched(Result<Vec<notion::NotionDatabase>, String>),
+    NotionSelectDatabase(String),
+    NotionSchemaFetched(Result<notion::NotionDatabase, String>),
+    NotionTasksFetched(Result<Vec<notion::NotionTask>, String>),
+    NotionRefresh,
+    NotionSetGroupBy(String),
+    NotionOpenTask(String),
+    NotionCloseTask,
+    GhostSetProject(usize),
+    CreateSessionFromTask,
 }
 
 // ─── App ───
@@ -202,7 +237,21 @@ struct App {
     session_name_input: String,
     show_session_dialog: Option<usize>,
     new_project_parent: Option<PathBuf>, // parent folder for "+" new project flow
-    launch_claude: bool,
+    launch_agent: bool,
+    agent_backend: AgentBackend,
+    notion_token: String,
+    notion_database_id: Option<String>,
+    notion_group_by_prop: Option<String>,
+    // Notion runtime (not persisted)
+    notion_databases: Vec<notion::NotionDatabase>,
+    notion_schema: Option<notion::NotionDatabase>,
+    notion_tasks: Vec<notion::NotionTask>,
+    notion_error: Option<String>,
+    notion_loading: bool,
+    screen: Screen,
+    open_task: Option<String>,
+    ghost_task: Option<notion::NotionTask>,
+    ghost_target_project: Option<usize>,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
@@ -236,7 +285,12 @@ impl Default for App {
             projects: Vec::new(), active_project: None, active_session: None,
             file_entries: Vec::new(), terminals: Vec::new(), next_term_id: 0,
             session_name_input: String::new(), show_session_dialog: None, new_project_parent: None,
-            launch_claude: true,
+            launch_agent: true,
+            agent_backend: AgentBackend::ClaudeCode,
+            notion_token: String::new(), notion_database_id: None, notion_group_by_prop: None,
+            notion_databases: Vec::new(), notion_schema: None, notion_tasks: Vec::new(),
+            notion_error: None, notion_loading: false,
+            screen: Screen::Ide, open_task: None, ghost_task: None, ghost_target_project: None,
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -273,6 +327,10 @@ impl App {
             app.dangerously_skip_permissions = state.dangerously_skip_permissions;
             app.quick_prompts = state.quick_prompts;
             app.date_prefix_enabled = state.date_prefix_enabled;
+            app.notion_token = state.notion_token;
+            app.notion_database_id = state.notion_database_id;
+            app.notion_group_by_prop = state.notion_group_by_prop;
+            app.agent_backend = AgentBackend::from_str(&state.agent_backend);
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -295,6 +353,13 @@ impl App {
                 move |info| Message::GitInfoFetched(pi, info),
             ));
         }
+        // Auto-load the Notion board when token + db are persisted
+        if !app.notion_token.is_empty() {
+            if let Some(db_id) = app.notion_database_id.clone() {
+                let tok = app.notion_token.clone();
+                boot_tasks.push(Task::perform(notion::fetch_schema(tok, db_id), Message::NotionSchemaFetched));
+            }
+        }
         (app, Task::batch(boot_tasks))
     }
     fn tc(&self) -> TC { self.current_theme.colors() }
@@ -307,23 +372,17 @@ impl App {
         self.next_term_id += 1;
 
         // Determine program and args
-        let skip_flag = if self.dangerously_skip_permissions { " --dangerously-skip-permissions" } else { "" };
-        let (program, args) = if self.launch_claude {
-            let claude_path = which_claude();
-            if resume {
-                let cmd = format!(
-                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
-                    claude_path, skip_flag, claude_path, session_name.replace('\'', "'\\''"), skip_flag
-                );
-                ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
-            } else {
-                let mut a = vec!["--name".to_string(), session_name];
-                if self.dangerously_skip_permissions { a.push("--dangerously-skip-permissions".to_string()); }
-                (claude_path, a)
-            }
-        } else {
-            (std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()), vec![])
-        };
+        let claude_path = which_claude();
+        let opencode_path = which_opencode();
+        let (program, args) = build_agent_command(
+            self.agent_backend,
+            self.launch_agent,
+            resume,
+            &claude_path,
+            &opencode_path,
+            &session_name,
+            self.dangerously_skip_permissions,
+        );
 
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
@@ -357,10 +416,12 @@ impl App {
 
         if let Ok(terminal) = iced_term::Terminal::new(tid, settings) {
             app_log!("  terminal created tid={}", tid);
-            // Setup hooks
-            let sid = &self.projects[pi].sessions[si].id;
-            if let Ok(hp) = hooks::create_hook_script(sid) {
-                let _ = hooks::configure_claude_hooks(&self.projects[pi].path, &hp);
+            // Setup hooks — only for Claude (OpenCode does not emit them)
+            if self.agent_backend == AgentBackend::ClaudeCode && self.launch_agent {
+                let sid = &self.projects[pi].sessions[si].id;
+                if let Ok(hp) = hooks::create_hook_script(sid) {
+                    let _ = hooks::configure_claude_hooks(&self.projects[pi].path, &hp);
+                }
             }
             self.terminals.push(((pi, si), TerminalInstance { terminal, id: tid }));
         }
@@ -375,6 +436,10 @@ impl App {
             dangerously_skip_permissions: self.dangerously_skip_permissions,
             quick_prompts: self.quick_prompts.clone(),
             date_prefix_enabled: self.date_prefix_enabled,
+            notion_token: self.notion_token.clone(),
+            notion_database_id: self.notion_database_id.clone(),
+            notion_group_by_prop: self.notion_group_by_prop.clone(),
+            agent_backend: self.agent_backend.as_str().to_string(),
         });
     }
 
@@ -412,7 +477,7 @@ impl App {
                         // Auto-open session name dialog with folder name as default
                         self.session_name_input = name;
                         self.show_session_dialog = Some(pi);
-                        self.launch_claude = true;
+                        self.launch_agent = true;
                         self.save_state();
                     }
                 }
@@ -423,11 +488,11 @@ impl App {
                     self.new_project_parent = Some(parent);
                     self.session_name_input = String::new();
                     self.show_session_dialog = Some(usize::MAX);
-                    self.launch_claude = true;
+                    self.launch_agent = true;
                 }
                 iced::widget::operation::focus_next()
             }
-            Message::ToggleLaunchClaude => { self.launch_claude = !self.launch_claude; Task::none() }
+            Message::ToggleLaunchClaude => { self.launch_agent = !self.launch_agent; Task::none() }
             Message::AddSession(pi) => {
                 self.show_session_dialog = Some(pi);
                 iced::widget::operation::focus_next()
@@ -970,6 +1035,102 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SetAgentBackend(b) => { self.agent_backend = b; self.save_state(); Task::none() }
+            Message::SetScreen(s) => { self.screen = s; Task::none() }
+            Message::NotionTokenChanged(t) => { self.notion_token = t; self.save_state(); Task::none() }
+            Message::NotionConnect => {
+                let tok = self.notion_token.clone();
+                if tok.is_empty() { return Task::none(); }
+                self.notion_loading = true; self.notion_error = None;
+                Task::perform(notion::list_databases(tok), Message::NotionDatabasesFetched)
+            }
+            Message::NotionDatabasesFetched(res) => {
+                self.notion_loading = false;
+                match res {
+                    Ok(dbs) => { self.notion_databases = dbs; self.notion_error = None; }
+                    Err(e) => self.notion_error = Some(e),
+                }
+                Task::none()
+            }
+            Message::NotionSelectDatabase(id) => {
+                self.notion_database_id = Some(id.clone());
+                self.notion_group_by_prop = None;
+                self.save_state();
+                let tok = self.notion_token.clone();
+                self.notion_loading = true;
+                Task::perform(notion::fetch_schema(tok, id), Message::NotionSchemaFetched)
+            }
+            Message::NotionSchemaFetched(res) => {
+                match res {
+                    Ok(db) => {
+                        if self.notion_group_by_prop.is_none() {
+                            self.notion_group_by_prop = db.props.iter()
+                                .find(|p| matches!(p.kind, notion::PropKind::Status(_)))
+                                .or_else(|| db.props.iter().find(|p| matches!(p.kind, notion::PropKind::Select(_))))
+                                .map(|p| p.id.clone());
+                        }
+                        let tok = self.notion_token.clone();
+                        let id = db.id.clone();
+                        let props = db.props.clone();
+                        self.notion_schema = Some(db);
+                        self.save_state();
+                        return Task::perform(notion::query_tasks(tok, id, props), Message::NotionTasksFetched);
+                    }
+                    Err(e) => { self.notion_loading = false; self.notion_error = Some(e); }
+                }
+                Task::none()
+            }
+            Message::NotionTasksFetched(res) => {
+                self.notion_loading = false;
+                match res {
+                    Ok(tasks) => { self.notion_tasks = tasks; self.notion_error = None; }
+                    Err(e) => self.notion_error = Some(e),
+                }
+                Task::none()
+            }
+            Message::NotionRefresh => {
+                if let Some(db) = self.notion_schema.clone() {
+                    let tok = self.notion_token.clone();
+                    self.notion_loading = true;
+                    return Task::perform(notion::query_tasks(tok, db.id.clone(), db.props.clone()), Message::NotionTasksFetched);
+                }
+                Task::none()
+            }
+            Message::NotionSetGroupBy(pid) => { self.notion_group_by_prop = Some(pid); self.save_state(); Task::none() }
+            Message::NotionOpenTask(id) => {
+                self.open_task = Some(id.clone());
+                if let Some(t) = self.notion_tasks.iter().find(|t| t.id == id).cloned() {
+                    self.ghost_task = Some(t);
+                    self.ghost_target_project = self.active_project;
+                }
+                Task::none()
+            }
+            Message::NotionCloseTask => { self.open_task = None; self.ghost_task = None; Task::none() }
+            Message::GhostSetProject(pi) => { self.ghost_target_project = Some(pi); Task::none() }
+            Message::CreateSessionFromTask => {
+                let Some(task) = self.ghost_task.clone() else { return Task::none(); };
+                let pi = match self.ghost_target_project.or(self.active_project) {
+                    Some(pi) if pi < self.projects.len() => pi,
+                    _ => { self.notion_error = Some("Pick a target project for the session".into()); return Task::none(); }
+                };
+                let schema_props = self.notion_schema.as_ref().map(|s| s.props.clone()).unwrap_or_default();
+                let md = task_to_markdown(&task, &schema_props);
+                let stripped: String = task.id.chars().filter(|c| *c != '-').collect();
+                let short = &stripped[..stripped.len().min(8)];
+                let fname = format!("TASK-{}.md", short);
+                let path = self.projects[pi].path.join(&fname);
+                let _ = std::fs::write(&path, md);
+                let name = if task.title.is_empty() { fname.clone() } else { task.title.clone() };
+                self.projects[pi].sessions.push(Session::new(name));
+                let si = self.projects[pi].sessions.len() - 1;
+                self.active_project = Some(pi);
+                self.active_session = Some((pi, si));
+                self.spawn_session_terminal(pi, si, false);
+                self.ghost_task = None; self.open_task = None;
+                self.screen = Screen::Ide;
+                self.save_state();
+                Task::none()
+            }
         }
     }
 
@@ -987,19 +1148,40 @@ impl App {
         };
 
         let tc1 = tc.clone();
-        let tc2 = tc.clone();
         let tc3 = tc.clone();
         let tc4 = tc.clone();
+        let tc5 = tc.clone();
+
+        let right: Element<'_, Message> = match self.screen {
+            Screen::Ide => row![
+                container(center).width(Fill).height(Fill)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
+                    }),
+                container(self.view_explorer()).width(260).height(Fill)
+                    .style(move |_: &Theme| styled_panel(&tc3)),
+            ].into(),
+            Screen::Board => {
+                let inner: Element<'_, Message> = if self.show_settings {
+                    self.view_settings()
+                } else if let Some(t) = self.open_task.as_ref()
+                    .and_then(|id| self.notion_tasks.iter().find(|t| &t.id == id)) {
+                    self.view_task_detail(t)
+                } else {
+                    self.view_board()
+                };
+                container(inner).width(Fill).height(Fill)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
+                    }).into()
+            }
+        };
 
         let main = row![
             container(self.view_sessions()).width(self.sidebar_width).height(Fill)
                 .style(move |_: &Theme| styled_panel(&tc1)),
-            container(center).width(Fill).height(Fill)
-                .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
-                }),
-            container(self.view_explorer()).width(260).height(Fill)
-                .style(move |_: &Theme| styled_panel(&tc3)),
+            container(right).width(Fill).height(Fill)
+                .style(move |_: &Theme| styled_panel(&tc5)),
         ];
 
         let status = container(
@@ -1041,8 +1223,8 @@ impl App {
 
         // New project dialog (when "+" pressed and parent folder selected)
         if self.show_session_dialog == Some(usize::MAX) {
-            let check_color = if self.launch_claude { tc.green } else { tc.text_muted };
-            let check_icon = if self.launch_claude { "☑" } else { "☐" };
+            let check_color = if self.launch_agent { tc.green } else { tc.text_muted };
+            let check_icon = if self.launch_agent { "☑" } else { "☐" };
             let parent_name = self.new_project_parent.as_ref()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string())
@@ -1264,8 +1446,8 @@ impl App {
 
             // Add session button or inline input
             if self.show_session_dialog == Some(pi) {
-                let check_color = if self.launch_claude { tc.green } else { tc.text_muted };
-                let check_icon = if self.launch_claude { "☑" } else { "☐" };
+                let check_color = if self.launch_agent { tc.green } else { tc.text_muted };
+                let check_icon = if self.launch_agent { "☑" } else { "☐" };
                 content = content.push(
                     container(column![
                         text_input("Session name...", &self.session_name_input)
@@ -1304,7 +1486,151 @@ impl App {
             );
         }
 
-        column![header, rule::horizontal(1), scrollable(content).height(Fill)].into()
+        // Screen switcher (IDE | Board) — persists across both screens
+        let seg = |label: &str, target: Screen| {
+            let active = self.screen == target;
+            button(text(label.to_string()).size(11)
+                .color(if active { tc.text_primary } else { tc.text_muted }))
+                .on_press(Message::SetScreen(target))
+                .style(if active { button::secondary } else { button::text })
+                .padding([4, 12])
+        };
+        let switcher = container(row![
+            seg("IDE", Screen::Ide), seg("Board", Screen::Board),
+        ].spacing(4)).padding([8, 10]);
+
+        // Ghost card — new session from the currently-open Notion task
+        let ghost: Element<'_, Message> = if let Some(gt) = &self.ghost_task {
+            let mut proj_picker = Row::new().spacing(4);
+            for (pi, p) in self.projects.iter().enumerate() {
+                let active = self.ghost_target_project == Some(pi)
+                    || (self.ghost_target_project.is_none() && self.active_project == Some(pi));
+                proj_picker = proj_picker.push(
+                    button(text(p.name.clone()).size(9).color(if active { tc.text_primary } else { tc.text_muted }))
+                        .on_press(Message::GhostSetProject(pi))
+                        .style(if active { button::secondary } else { button::text }).padding([2,6])
+                );
+            }
+            let tcg = tc.clone();
+            container(column![
+                text("NEW SESSION FROM TASK").size(8).color(tc.text_muted),
+                text(gt.title.clone()).size(12).color(tc.text_primary),
+                scrollable(proj_picker).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())),
+                button(text("＋ Create session").size(11).color(tc.green))
+                    .on_press(Message::CreateSessionFromTask).style(button::text).padding([2,0]),
+            ].spacing(6).padding(10))
+            .style(move |_: &Theme| container::Style {
+                border: Border { color: tcg.border_active, width: 1.0, radius: 6.0.into(), ..Default::default() },
+                ..styled_panel(&tcg)
+            }).into()
+        } else { Space::new().height(0).into() };
+
+        column![switcher, ghost, header, rule::horizontal(1), scrollable(content).height(Fill)].into()
+    }
+
+    fn view_board(&self) -> Element<'_, Message> {
+        let tc = self.tc();
+
+        let Some(schema) = self.notion_schema.as_ref() else {
+            return container(column![
+                text("No Notion board connected").size(14).color(tc.text_primary),
+                text("Open Settings → Notion, paste a token and pick a database.").size(11).color(tc.text_muted),
+                button(text("Open Settings").size(12)).on_press(Message::ToggleSettings).style(button::secondary).padding([6,12]),
+            ].spacing(10).align_x(iced::Alignment::Center)).center_x(Fill).center_y(Fill).into();
+        };
+
+        let gp_id = self.notion_group_by_prop.clone().unwrap_or_default();
+        let options: Vec<notion::SelectOption> = schema.props.iter()
+            .find(|p| p.id == gp_id)
+            .map(|p| match &p.kind {
+                notion::PropKind::Status(o) | notion::PropKind::Select(o) => o.clone(),
+                _ => vec![],
+            }).unwrap_or_default();
+
+        let mut groupby_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        groupby_row = groupby_row.push(text("Group by:").size(11).color(tc.text_muted));
+        for p in schema.props.iter().filter(|p| matches!(p.kind, notion::PropKind::Status(_) | notion::PropKind::Select(_))) {
+            let active = self.notion_group_by_prop.as_deref() == Some(p.id.as_str());
+            groupby_row = groupby_row.push(
+                button(text(p.name.clone()).size(11).color(if active { tc.text_primary } else { tc.text_muted }))
+                    .on_press(Message::NotionSetGroupBy(p.id.clone()))
+                    .style(if active { button::secondary } else { button::text }).padding([2,8])
+            );
+        }
+        let loading_lbl = if self.notion_loading { " (loading…)" } else { "" };
+        let topbar = container(row![
+            text(format!("{}{}", schema.title.clone(), loading_lbl)).size(14).color(tc.text_primary),
+            Space::new().width(Fill),
+            groupby_row,
+            button(text("⟳").size(13).color(tc.text_muted)).on_press(Message::NotionRefresh).style(button::text).padding(2),
+        ].spacing(12).align_y(iced::Alignment::Center)).padding([10, 16]);
+
+        let err_banner: Element<'_, Message> = if let Some(e) = &self.notion_error {
+            container(text(format!("⚠ {e}")).size(11).color(tc.red)).padding([4,16]).into()
+        } else { Space::new().height(0).into() };
+
+        let cols = group_tasks(&self.notion_tasks, &gp_id, &options);
+        let mut board_row = Row::new().spacing(12).padding(12);
+        for (label, tasks) in cols {
+            let mut col = Column::new().spacing(8).padding(8);
+            col = col.push(text(format!("{}  ({})", label, tasks.len())).size(11).color(tc.text_muted));
+            for t in tasks {
+                let tid = t.id.clone();
+                let card = button(
+                    column![ text(t.title.clone()).size(12).color(tc.text_primary) ].spacing(4)
+                ).on_press(Message::NotionOpenTask(tid)).style(button::secondary).padding(10).width(Fill);
+                col = col.push(card);
+            }
+            let tc_col = tc.clone();
+            board_row = board_row.push(
+                container(scrollable(col)).width(240).height(Fill)
+                    .style(move |_: &Theme| styled_panel(&tc_col))
+            );
+        }
+
+        column![
+            topbar, err_banner,
+            scrollable(board_row)
+                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new()))
+                .height(Fill),
+        ].into()
+    }
+
+    fn view_task_detail(&self, task: &notion::NotionTask) -> Element<'_, Message> {
+        let tc = self.tc();
+        let schema = self.notion_schema.as_ref();
+        let header = container(row![
+            text(task.title.clone()).size(15).color(tc.text_primary),
+            Space::new().width(Fill),
+            button(text("Open in Notion").size(10).color(tc.blue))
+                .on_press(Message::OpenUrl(task.url.clone())).style(button::text).padding([2,6]),
+            button(text("✕").size(14).color(tc.text_muted)).on_press(Message::NotionCloseTask).style(button::text).padding(4),
+        ].align_y(iced::Alignment::Center)).padding([14,18]);
+
+        let mut props_col = Column::new().spacing(8).padding([8,18]);
+        if let Some(sch) = schema {
+            for p in &sch.props {
+                if matches!(p.kind, notion::PropKind::Title) { continue; }
+                let rendered = match task.props.get(&p.id) {
+                    Some(notion::PropValue::Text(s)) => s.clone(),
+                    Some(notion::PropValue::Number(n)) => n.to_string(),
+                    Some(notion::PropValue::Checkbox(b)) => if *b {"☑".into()} else {"☐".into()},
+                    Some(notion::PropValue::Url(u)) => u.clone(),
+                    Some(notion::PropValue::Date(d)) => d.clone(),
+                    Some(notion::PropValue::Select(Some(o))) => o.name.clone(),
+                    Some(notion::PropValue::MultiSelect(v)) => v.iter().map(|o| o.name.clone()).collect::<Vec<_>>().join(", "),
+                    Some(notion::PropValue::People(v)) => v.join(", "),
+                    Some(notion::PropValue::Raw(_)) => "—".into(),
+                    _ => "".into(),
+                };
+                props_col = props_col.push(row![
+                    text(p.name.clone()).size(11).color(tc.text_muted).width(160),
+                    text(rendered).size(12).color(tc.text_secondary).width(Fill),
+                ].spacing(8));
+            }
+        }
+
+        column![header, rule::horizontal(1), scrollable(props_col).height(Fill)].into()
     }
 
     fn view_terminal(&self) -> Element<'_, Message> {
@@ -1675,6 +2001,55 @@ impl App {
             ].spacing(4).align_y(iced::Alignment::Center)
         );
 
+        // Agent backend select
+        let backend_btn = |label: &str, b: AgentBackend| {
+            let active = self.agent_backend == b;
+            button(text(label.to_string()).size(11)
+                .color(if active { tc.text_primary } else { tc.text_muted }))
+                .on_press(Message::SetAgentBackend(b))
+                .style(if active { button::secondary } else { button::text }).padding([4,12])
+        };
+        let agent_section = column![
+            text("Agent Backend").size(12).color(tc.text_muted),
+            row![
+                backend_btn(AgentBackend::ClaudeCode.label(), AgentBackend::ClaudeCode),
+                backend_btn(AgentBackend::OpenCode.label(), AgentBackend::OpenCode),
+            ].spacing(6),
+            text("OpenCode sessions have no live status tracking (no hooks).").size(9).color(tc.text_muted),
+        ].spacing(6);
+
+        // Notion section
+        let mut notion_section = Column::new().spacing(6);
+        notion_section = notion_section.push(text("Notion").size(12).color(tc.text_muted));
+        notion_section = notion_section.push(
+            text_input("Notion integration token (secret_...)", &self.notion_token)
+                .on_input(Message::NotionTokenChanged)
+                .on_submit(Message::NotionConnect)
+                .size(12).padding(6)
+        );
+        notion_section = notion_section.push(
+            button(text(if self.notion_loading { "Connecting…" } else { "Connect / List databases" }).size(11).color(tc.blue))
+                .on_press(Message::NotionConnect).style(button::text).padding([2,0])
+        );
+        if !self.notion_databases.is_empty() {
+            let mut dbs = Column::new().spacing(4);
+            for db in &self.notion_databases {
+                let active = self.notion_database_id.as_deref() == Some(db.id.as_str());
+                dbs = dbs.push(
+                    button(row![
+                        text(if active {"●"} else {"○"}).size(11).color(if active { tc.green } else { tc.text_muted }),
+                        text(db.title.clone()).size(11).color(tc.text_secondary),
+                    ].spacing(6))
+                    .on_press(Message::NotionSelectDatabase(db.id.clone()))
+                    .style(button::text).padding([2,0])
+                );
+            }
+            notion_section = notion_section.push(dbs);
+        }
+        if let Some(e) = &self.notion_error {
+            notion_section = notion_section.push(text(format!("⚠ {e}")).size(10).color(tc.red));
+        }
+
         // Footer
         let footer = container(
             column![
@@ -1688,6 +2063,10 @@ impl App {
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
+                agent_section,
+                Space::new().height(16),
+                notion_section,
+                Space::new().height(16),
                 text("Color Theme").size(12).color(tc.text_muted),
                 themes,
                 Space::new().height(16),
@@ -1879,6 +2258,20 @@ fn message_label(m: &Message) -> &'static str {
         Message::ToggleSettings => "ToggleSettings",
         Message::SetTheme(_) => "SetTheme",
         Message::TermEvent(_) => "TermEvent",
+        Message::SetAgentBackend(_) => "SetAgentBackend",
+        Message::SetScreen(_) => "SetScreen",
+        Message::NotionTokenChanged(_) => "NotionTokenChanged",
+        Message::NotionConnect => "NotionConnect",
+        Message::NotionDatabasesFetched(_) => "NotionDatabasesFetched",
+        Message::NotionSelectDatabase(_) => "NotionSelectDatabase",
+        Message::NotionSchemaFetched(_) => "NotionSchemaFetched",
+        Message::NotionTasksFetched(_) => "NotionTasksFetched",
+        Message::NotionRefresh => "NotionRefresh",
+        Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
+        Message::NotionOpenTask(_) => "NotionOpenTask",
+        Message::NotionCloseTask => "NotionCloseTask",
+        Message::GhostSetProject(_) => "GhostSetProject",
+        Message::CreateSessionFromTask => "CreateSessionFromTask",
     }
 }
 
@@ -1981,4 +2374,201 @@ fn chip<'a>(label: &str, color: Color) -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// Pure decision: given backend + flags, return (program, args) for the terminal.
+/// `launch_agent` false => plain login shell. Resume only meaningful for Claude.
+fn build_agent_command(
+    backend: AgentBackend,
+    launch_agent: bool,
+    resume: bool,
+    claude_path: &str,
+    opencode_path: &str,
+    session_name: &str,
+    skip_perms: bool,
+) -> (String, Vec<String>) {
+    if !launch_agent {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        return (sh, vec![]);
+    }
+    match backend {
+        AgentBackend::OpenCode => (opencode_path.to_string(), vec![]),
+        AgentBackend::ClaudeCode => {
+            let skip_flag = if skip_perms { " --dangerously-skip-permissions" } else { "" };
+            if resume {
+                let cmd = format!(
+                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
+                    claude_path, skip_flag, claude_path,
+                    session_name.replace('\'', "'\\''"), skip_flag
+                );
+                ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
+            } else {
+                let mut a = vec!["--name".to_string(), session_name.to_string()];
+                if skip_perms { a.push("--dangerously-skip-permissions".to_string()); }
+                (claude_path.to_string(), a)
+            }
+        }
+    }
+}
+
+/// Find opencode binary path (mirrors which_claude).
+fn which_opencode() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
+        .args(["-lc", "which opencode"]).output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() { return p; }
+        }
+    }
+    let fallbacks = [
+        dirs::home_dir().map(|h| h.join(".opencode/bin/opencode").to_string_lossy().to_string()),
+        Some("/usr/local/bin/opencode".to_string()),
+        Some("/opt/homebrew/bin/opencode".to_string()),
+    ];
+    for f in fallbacks.into_iter().flatten() {
+        if std::path::Path::new(&f).exists() { return f; }
+    }
+    "opencode".to_string()
+}
+
+/// Render a Notion task to markdown for the TASK-*.md seed file.
+fn task_to_markdown(task: &notion::NotionTask, schema: &[notion::NotionProp]) -> String {
+    use notion::PropValue::*;
+    let mut s = format!("# {}\n\n", if task.title.is_empty() { "Untitled task" } else { &task.title });
+    if !task.url.is_empty() { s.push_str(&format!("Notion: {}\n\n", task.url)); }
+    s.push_str("## Properties\n\n");
+    for p in schema {
+        if matches!(p.kind, notion::PropKind::Title) { continue; }
+        let v = match task.props.get(&p.id) {
+            Some(Text(t)) if !t.is_empty() => t.clone(),
+            Some(Number(n)) => n.to_string(),
+            Some(Checkbox(b)) => if *b {"yes".into()} else {"no".into()},
+            Some(Url(u)) if !u.is_empty() => u.clone(),
+            Some(Date(d)) => d.clone(),
+            Some(Select(Some(o))) => o.name.clone(),
+            Some(MultiSelect(v)) if !v.is_empty() => v.iter().map(|o| o.name.clone()).collect::<Vec<_>>().join(", "),
+            Some(People(v)) if !v.is_empty() => v.join(", "),
+            _ => continue,
+        };
+        s.push_str(&format!("- {}: {}\n", p.name, v));
+    }
+    s
+}
+
+/// Group tasks into ordered columns by the group-by property's options,
+/// plus a trailing "(none)" column. Returns Vec<(column_label, task_refs)>.
+fn group_tasks<'a>(
+    tasks: &'a [notion::NotionTask],
+    group_prop_id: &str,
+    options: &[notion::SelectOption],
+) -> Vec<(String, Vec<&'a notion::NotionTask>)> {
+    let mut cols: Vec<(String, Vec<&notion::NotionTask>)> =
+        options.iter().map(|o| (o.name.clone(), Vec::new())).collect();
+    let mut none_bucket: Vec<&notion::NotionTask> = Vec::new();
+    for t in tasks {
+        let name = match t.props.get(group_prop_id) {
+            Some(notion::PropValue::Select(Some(o))) => Some(o.name.clone()),
+            _ => None,
+        };
+        match name {
+            Some(n) => {
+                if let Some(col) = cols.iter_mut().find(|(label, _)| *label == n) { col.1.push(t); }
+                else { none_bucket.push(t); }
+            }
+            None => none_bucket.push(t),
+        }
+    }
+    cols.push(("(none)".to_string(), none_bucket));
+    cols
+}
+
+#[cfg(test)]
+mod board_md_tests {
+    use super::*;
+    use notion::*;
+    use std::collections::HashMap;
+
+    fn task(id: &str, status: Option<&str>) -> NotionTask {
+        let mut props = HashMap::new();
+        props.insert("stat".to_string(), match status {
+            Some(s) => PropValue::Select(Some(SelectOption{id:s.into(),name:s.into(),color:"gray".into()})),
+            None => PropValue::Empty,
+        });
+        NotionTask { id: id.into(), title: id.into(), url: "".into(), props }
+    }
+
+    #[test]
+    fn groups_tasks_by_status_with_none_bucket() {
+        let opts = vec![
+            SelectOption{id:"Todo".into(),name:"Todo".into(),color:"gray".into()},
+            SelectOption{id:"Done".into(),name:"Done".into(),color:"green".into()},
+        ];
+        let tasks = vec![task("a", Some("Todo")), task("b", Some("Done")), task("c", None)];
+        let cols = group_tasks(&tasks, "stat", &opts);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].0, "Todo"); assert_eq!(cols[0].1.len(), 1);
+        assert_eq!(cols[2].0, "(none)"); assert_eq!(cols[2].1.len(), 1);
+    }
+
+    #[test]
+    fn renders_title_url_and_a_prop() {
+        let mut props = HashMap::new();
+        props.insert("stat".into(), PropValue::Select(Some(SelectOption{id:"s".into(),name:"Todo".into(),color:"gray".into()})));
+        let t = NotionTask { id:"pg1".into(), title:"Fix login".into(), url:"https://notion.so/pg1".into(), props };
+        let schema = vec![
+            NotionProp{id:"title".into(),name:"Name".into(),kind:PropKind::Title},
+            NotionProp{id:"stat".into(),name:"Status".into(),kind:PropKind::Status(vec![])},
+        ];
+        let md = task_to_markdown(&t, &schema);
+        assert!(md.starts_with("# Fix login"));
+        assert!(md.contains("https://notion.so/pg1"));
+        assert!(md.contains("Status: Todo"));
+    }
+}
+
+#[cfg(test)]
+mod agent_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn claude_fresh_uses_name_flag() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::ClaudeCode, true, false,
+            "/bin/claude", "/bin/opencode", "my task", true,
+        );
+        assert_eq!(prog, "/bin/claude");
+        assert_eq!(args, vec!["--name", "my task", "--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn claude_resume_uses_continue_shell() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::ClaudeCode, true, true,
+            "/bin/claude", "/bin/opencode", "my task", false,
+        );
+        assert_eq!(prog, "/bin/sh");
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("--continue"));
+    }
+
+    #[test]
+    fn opencode_runs_bare_in_cwd() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::OpenCode, true, false,
+            "/bin/claude", "/bin/opencode", "my task", true,
+        );
+        assert_eq!(prog, "/bin/opencode");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn plain_shell_when_agent_off() {
+        let (prog, _args) = build_agent_command(
+            AgentBackend::ClaudeCode, false, false,
+            "/bin/claude", "/bin/opencode", "x", true,
+        );
+        assert!(prog.ends_with("sh") || prog.ends_with("zsh") || prog.contains("/"));
+    }
 }

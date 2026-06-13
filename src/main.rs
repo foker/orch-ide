@@ -1148,19 +1148,40 @@ impl App {
         };
 
         let tc1 = tc.clone();
-        let tc2 = tc.clone();
         let tc3 = tc.clone();
         let tc4 = tc.clone();
+        let tc5 = tc.clone();
+
+        let right: Element<'_, Message> = match self.screen {
+            Screen::Ide => row![
+                container(center).width(Fill).height(Fill)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
+                    }),
+                container(self.view_explorer()).width(260).height(Fill)
+                    .style(move |_: &Theme| styled_panel(&tc3)),
+            ].into(),
+            Screen::Board => {
+                let inner: Element<'_, Message> = if self.show_settings {
+                    self.view_settings()
+                } else if let Some(t) = self.open_task.as_ref()
+                    .and_then(|id| self.notion_tasks.iter().find(|t| &t.id == id)) {
+                    self.view_task_detail(t)
+                } else {
+                    self.view_board()
+                };
+                container(inner).width(Fill).height(Fill)
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
+                    }).into()
+            }
+        };
 
         let main = row![
             container(self.view_sessions()).width(self.sidebar_width).height(Fill)
                 .style(move |_: &Theme| styled_panel(&tc1)),
-            container(center).width(Fill).height(Fill)
-                .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(c(0x17, 0x1b, 0x21))), ..Default::default()
-                }),
-            container(self.view_explorer()).width(260).height(Fill)
-                .style(move |_: &Theme| styled_panel(&tc3)),
+            container(right).width(Fill).height(Fill)
+                .style(move |_: &Theme| styled_panel(&tc5)),
         ];
 
         let status = container(
@@ -1465,7 +1486,151 @@ impl App {
             );
         }
 
-        column![header, rule::horizontal(1), scrollable(content).height(Fill)].into()
+        // Screen switcher (IDE | Board) — persists across both screens
+        let seg = |label: &str, target: Screen| {
+            let active = self.screen == target;
+            button(text(label.to_string()).size(11)
+                .color(if active { tc.text_primary } else { tc.text_muted }))
+                .on_press(Message::SetScreen(target))
+                .style(if active { button::secondary } else { button::text })
+                .padding([4, 12])
+        };
+        let switcher = container(row![
+            seg("IDE", Screen::Ide), seg("Board", Screen::Board),
+        ].spacing(4)).padding([8, 10]);
+
+        // Ghost card — new session from the currently-open Notion task
+        let ghost: Element<'_, Message> = if let Some(gt) = &self.ghost_task {
+            let mut proj_picker = Row::new().spacing(4);
+            for (pi, p) in self.projects.iter().enumerate() {
+                let active = self.ghost_target_project == Some(pi)
+                    || (self.ghost_target_project.is_none() && self.active_project == Some(pi));
+                proj_picker = proj_picker.push(
+                    button(text(p.name.clone()).size(9).color(if active { tc.text_primary } else { tc.text_muted }))
+                        .on_press(Message::GhostSetProject(pi))
+                        .style(if active { button::secondary } else { button::text }).padding([2,6])
+                );
+            }
+            let tcg = tc.clone();
+            container(column![
+                text("NEW SESSION FROM TASK").size(8).color(tc.text_muted),
+                text(gt.title.clone()).size(12).color(tc.text_primary),
+                scrollable(proj_picker).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new())),
+                button(text("＋ Create session").size(11).color(tc.green))
+                    .on_press(Message::CreateSessionFromTask).style(button::text).padding([2,0]),
+            ].spacing(6).padding(10))
+            .style(move |_: &Theme| container::Style {
+                border: Border { color: tcg.border_active, width: 1.0, radius: 6.0.into(), ..Default::default() },
+                ..styled_panel(&tcg)
+            }).into()
+        } else { Space::new().height(0).into() };
+
+        column![switcher, ghost, header, rule::horizontal(1), scrollable(content).height(Fill)].into()
+    }
+
+    fn view_board(&self) -> Element<'_, Message> {
+        let tc = self.tc();
+
+        let Some(schema) = self.notion_schema.as_ref() else {
+            return container(column![
+                text("No Notion board connected").size(14).color(tc.text_primary),
+                text("Open Settings → Notion, paste a token and pick a database.").size(11).color(tc.text_muted),
+                button(text("Open Settings").size(12)).on_press(Message::ToggleSettings).style(button::secondary).padding([6,12]),
+            ].spacing(10).align_x(iced::Alignment::Center)).center_x(Fill).center_y(Fill).into();
+        };
+
+        let gp_id = self.notion_group_by_prop.clone().unwrap_or_default();
+        let options: Vec<notion::SelectOption> = schema.props.iter()
+            .find(|p| p.id == gp_id)
+            .map(|p| match &p.kind {
+                notion::PropKind::Status(o) | notion::PropKind::Select(o) => o.clone(),
+                _ => vec![],
+            }).unwrap_or_default();
+
+        let mut groupby_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        groupby_row = groupby_row.push(text("Group by:").size(11).color(tc.text_muted));
+        for p in schema.props.iter().filter(|p| matches!(p.kind, notion::PropKind::Status(_) | notion::PropKind::Select(_))) {
+            let active = self.notion_group_by_prop.as_deref() == Some(p.id.as_str());
+            groupby_row = groupby_row.push(
+                button(text(p.name.clone()).size(11).color(if active { tc.text_primary } else { tc.text_muted }))
+                    .on_press(Message::NotionSetGroupBy(p.id.clone()))
+                    .style(if active { button::secondary } else { button::text }).padding([2,8])
+            );
+        }
+        let loading_lbl = if self.notion_loading { " (loading…)" } else { "" };
+        let topbar = container(row![
+            text(format!("{}{}", schema.title.clone(), loading_lbl)).size(14).color(tc.text_primary),
+            Space::new().width(Fill),
+            groupby_row,
+            button(text("⟳").size(13).color(tc.text_muted)).on_press(Message::NotionRefresh).style(button::text).padding(2),
+        ].spacing(12).align_y(iced::Alignment::Center)).padding([10, 16]);
+
+        let err_banner: Element<'_, Message> = if let Some(e) = &self.notion_error {
+            container(text(format!("⚠ {e}")).size(11).color(tc.red)).padding([4,16]).into()
+        } else { Space::new().height(0).into() };
+
+        let cols = group_tasks(&self.notion_tasks, &gp_id, &options);
+        let mut board_row = Row::new().spacing(12).padding(12);
+        for (label, tasks) in cols {
+            let mut col = Column::new().spacing(8).padding(8);
+            col = col.push(text(format!("{}  ({})", label, tasks.len())).size(11).color(tc.text_muted));
+            for t in tasks {
+                let tid = t.id.clone();
+                let card = button(
+                    column![ text(t.title.clone()).size(12).color(tc.text_primary) ].spacing(4)
+                ).on_press(Message::NotionOpenTask(tid)).style(button::secondary).padding(10).width(Fill);
+                col = col.push(card);
+            }
+            let tc_col = tc.clone();
+            board_row = board_row.push(
+                container(scrollable(col)).width(240).height(Fill)
+                    .style(move |_: &Theme| styled_panel(&tc_col))
+            );
+        }
+
+        column![
+            topbar, err_banner,
+            scrollable(board_row)
+                .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new()))
+                .height(Fill),
+        ].into()
+    }
+
+    fn view_task_detail(&self, task: &notion::NotionTask) -> Element<'_, Message> {
+        let tc = self.tc();
+        let schema = self.notion_schema.as_ref();
+        let header = container(row![
+            text(task.title.clone()).size(15).color(tc.text_primary),
+            Space::new().width(Fill),
+            button(text("Open in Notion").size(10).color(tc.blue))
+                .on_press(Message::OpenUrl(task.url.clone())).style(button::text).padding([2,6]),
+            button(text("✕").size(14).color(tc.text_muted)).on_press(Message::NotionCloseTask).style(button::text).padding(4),
+        ].align_y(iced::Alignment::Center)).padding([14,18]);
+
+        let mut props_col = Column::new().spacing(8).padding([8,18]);
+        if let Some(sch) = schema {
+            for p in &sch.props {
+                if matches!(p.kind, notion::PropKind::Title) { continue; }
+                let rendered = match task.props.get(&p.id) {
+                    Some(notion::PropValue::Text(s)) => s.clone(),
+                    Some(notion::PropValue::Number(n)) => n.to_string(),
+                    Some(notion::PropValue::Checkbox(b)) => if *b {"☑".into()} else {"☐".into()},
+                    Some(notion::PropValue::Url(u)) => u.clone(),
+                    Some(notion::PropValue::Date(d)) => d.clone(),
+                    Some(notion::PropValue::Select(Some(o))) => o.name.clone(),
+                    Some(notion::PropValue::MultiSelect(v)) => v.iter().map(|o| o.name.clone()).collect::<Vec<_>>().join(", "),
+                    Some(notion::PropValue::People(v)) => v.join(", "),
+                    Some(notion::PropValue::Raw(_)) => "—".into(),
+                    _ => "".into(),
+                };
+                props_col = props_col.push(row![
+                    text(p.name.clone()).size(11).color(tc.text_muted).width(160),
+                    text(rendered).size(12).color(tc.text_secondary).width(Fill),
+                ].spacing(8));
+            }
+        }
+
+        column![header, rule::horizontal(1), scrollable(props_col).height(Fill)].into()
     }
 
     fn view_terminal(&self) -> Element<'_, Message> {
@@ -1836,6 +2001,55 @@ impl App {
             ].spacing(4).align_y(iced::Alignment::Center)
         );
 
+        // Agent backend select
+        let backend_btn = |label: &str, b: AgentBackend| {
+            let active = self.agent_backend == b;
+            button(text(label.to_string()).size(11)
+                .color(if active { tc.text_primary } else { tc.text_muted }))
+                .on_press(Message::SetAgentBackend(b))
+                .style(if active { button::secondary } else { button::text }).padding([4,12])
+        };
+        let agent_section = column![
+            text("Agent Backend").size(12).color(tc.text_muted),
+            row![
+                backend_btn(AgentBackend::ClaudeCode.label(), AgentBackend::ClaudeCode),
+                backend_btn(AgentBackend::OpenCode.label(), AgentBackend::OpenCode),
+            ].spacing(6),
+            text("OpenCode sessions have no live status tracking (no hooks).").size(9).color(tc.text_muted),
+        ].spacing(6);
+
+        // Notion section
+        let mut notion_section = Column::new().spacing(6);
+        notion_section = notion_section.push(text("Notion").size(12).color(tc.text_muted));
+        notion_section = notion_section.push(
+            text_input("Notion integration token (secret_...)", &self.notion_token)
+                .on_input(Message::NotionTokenChanged)
+                .on_submit(Message::NotionConnect)
+                .size(12).padding(6)
+        );
+        notion_section = notion_section.push(
+            button(text(if self.notion_loading { "Connecting…" } else { "Connect / List databases" }).size(11).color(tc.blue))
+                .on_press(Message::NotionConnect).style(button::text).padding([2,0])
+        );
+        if !self.notion_databases.is_empty() {
+            let mut dbs = Column::new().spacing(4);
+            for db in &self.notion_databases {
+                let active = self.notion_database_id.as_deref() == Some(db.id.as_str());
+                dbs = dbs.push(
+                    button(row![
+                        text(if active {"●"} else {"○"}).size(11).color(if active { tc.green } else { tc.text_muted }),
+                        text(db.title.clone()).size(11).color(tc.text_secondary),
+                    ].spacing(6))
+                    .on_press(Message::NotionSelectDatabase(db.id.clone()))
+                    .style(button::text).padding([2,0])
+                );
+            }
+            notion_section = notion_section.push(dbs);
+        }
+        if let Some(e) = &self.notion_error {
+            notion_section = notion_section.push(text(format!("⚠ {e}")).size(10).color(tc.red));
+        }
+
         // Footer
         let footer = container(
             column![
@@ -1849,6 +2063,10 @@ impl App {
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
+                agent_section,
+                Space::new().height(16),
+                notion_section,
+                Space::new().height(16),
                 text("Color Theme").size(12).color(tc.text_muted),
                 themes,
                 Space::new().height(16),

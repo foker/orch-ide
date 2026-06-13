@@ -234,6 +234,7 @@ enum Message {
     NotionRefresh,
     NotionSetGroupBy(String),
     NotionOpenTask(String),
+    NotionBodyFetched(String, Result<Vec<notion::Block>, String>),
     NotionCloseTask,
     TaskOpenDir,
     TaskNewDir,
@@ -269,6 +270,8 @@ struct App {
     notion_loading: bool,
     screen: Screen,
     open_task: Option<String>,
+    open_task_body: Vec<notion::Block>,
+    open_task_body_loading: bool,
     task_links: std::collections::HashMap<String, Vec<persistence::TaskLink>>,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
@@ -308,7 +311,8 @@ impl Default for App {
             notion_token: String::new(), notion_database_id: None, notion_group_by_prop: None,
             notion_databases: Vec::new(), notion_schema: None, notion_tasks: Vec::new(),
             notion_error: None, notion_loading: false,
-            screen: Screen::Ide, open_task: None, task_links: std::collections::HashMap::new(),
+            screen: Screen::Ide, open_task: None, open_task_body: Vec::new(), open_task_body_loading: false,
+            task_links: std::collections::HashMap::new(),
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -1133,8 +1137,25 @@ impl App {
                 Task::none()
             }
             Message::NotionSetGroupBy(pid) => { self.notion_group_by_prop = Some(pid); self.save_state(); Task::none() }
-            Message::NotionOpenTask(id) => { self.open_task = Some(id); Task::none() }
-            Message::NotionCloseTask => { self.open_task = None; Task::none() }
+            Message::NotionOpenTask(id) => {
+                self.open_task = Some(id.clone());
+                self.open_task_body = Vec::new();
+                self.open_task_body_loading = true;
+                let tok = self.notion_token.clone();
+                Task::perform(notion::fetch_blocks(tok, id.clone()), move |res| Message::NotionBodyFetched(id.clone(), res))
+            }
+            Message::NotionBodyFetched(id, res) => {
+                // ignore stale results for a task that's no longer open
+                if self.open_task.as_deref() == Some(id.as_str()) {
+                    self.open_task_body_loading = false;
+                    match res {
+                        Ok(blocks) => self.open_task_body = blocks,
+                        Err(e) => { self.open_task_body = Vec::new(); self.notion_error = Some(e); }
+                    }
+                }
+                Task::none()
+            }
+            Message::NotionCloseTask => { self.open_task = None; self.open_task_body = Vec::new(); Task::none() }
             Message::TaskOpenDir => {
                 Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Open directory for this task's session")
@@ -1222,7 +1243,19 @@ impl App {
         let Some(task) = self.current_open_task() else { return; };
         if pi >= self.projects.len() { return; }
         let schema_props = self.notion_schema.as_ref().map(|s| s.props.clone()).unwrap_or_default();
-        let md = task_to_markdown(&task, &schema_props);
+        let mut md = task_to_markdown(&task, &schema_props);
+        if !self.open_task_body.is_empty() {
+            md.push_str("\n## Description\n\n");
+            for b in &self.open_task_body {
+                match b.kind.as_str() {
+                    "heading_1" | "heading_2" | "heading_3" => md.push_str(&format!("\n### {}\n", b.text)),
+                    "to_do" => md.push_str(&format!("- [{}] {}\n", if b.checked == Some(true) {"x"} else {" "}, b.text)),
+                    "bulleted_list_item" | "numbered_list_item" => md.push_str(&format!("- {}\n", b.text)),
+                    "divider" => md.push_str("\n---\n"),
+                    _ => md.push_str(&format!("{}\n", b.text)),
+                }
+            }
+        }
         let stripped: String = task.id.chars().filter(|c| *c != '-').collect();
         let short = &stripped[..stripped.len().min(8)];
         let fname = format!("TASK-{}.md", short);
@@ -1726,6 +1759,42 @@ impl App {
             }
         }
 
+        // ── Body / description (page content blocks) ──
+        let mut body_col = Column::new().spacing(6).padding([8, 18]);
+        if self.open_task_body_loading {
+            body_col = body_col.push(text("Loading description…").size(11).color(tc.text_muted));
+        } else if !self.open_task_body.is_empty() {
+            body_col = body_col.push(text("DESCRIPTION").size(10).color(tc.text_muted));
+            for b in &self.open_task_body {
+                let el: Element<'_, Message> = match b.kind.as_str() {
+                    "heading_1" => text(b.text.clone()).size(16).color(tc.text_primary).into(),
+                    "heading_2" => text(b.text.clone()).size(14).color(tc.text_primary).into(),
+                    "heading_3" => text(b.text.clone()).size(13).color(tc.text_primary).into(),
+                    "to_do" => row![
+                        text(if b.checked == Some(true) {"☑"} else {"☐"}).size(12)
+                            .color(if b.checked == Some(true) { tc.green } else { tc.text_muted }),
+                        text(b.text.clone()).size(12).color(tc.text_secondary).width(Fill),
+                    ].spacing(6).into(),
+                    "bulleted_list_item" => row![
+                        text("•").size(12).color(tc.text_muted),
+                        text(b.text.clone()).size(12).color(tc.text_secondary).width(Fill),
+                    ].spacing(6).into(),
+                    "numbered_list_item" => row![
+                        text("–").size(12).color(tc.text_muted),
+                        text(b.text.clone()).size(12).color(tc.text_secondary).width(Fill),
+                    ].spacing(6).into(),
+                    "quote" => row![
+                        text("▎").size(12).color(tc.text_muted),
+                        text(b.text.clone()).size(12).color(tc.text_secondary).width(Fill),
+                    ].spacing(6).into(),
+                    "code" => text(b.text.clone()).size(11).font(MONO_FONT).color(tc.text_secondary).into(),
+                    "divider" => rule::horizontal(1).into(),
+                    _ => text(b.text.clone()).size(12).color(tc.text_secondary).into(),
+                };
+                body_col = body_col.push(el);
+            }
+        }
+
         // ── Footer: create / reopen a session affiliated with this task ──
         let green = tc.green;
         let mut footer = Column::new().spacing(8).padding([12, 18]);
@@ -1760,7 +1829,7 @@ impl App {
 
         column![
             header, rule::horizontal(1),
-            scrollable(props_col).height(Fill),
+            scrollable(column![props_col, body_col].spacing(8)).height(Fill),
             rule::horizontal(1),
             footer,
         ].into()
@@ -2402,6 +2471,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::NotionRefresh => "NotionRefresh",
         Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
         Message::NotionOpenTask(_) => "NotionOpenTask",
+        Message::NotionBodyFetched(_, _) => "NotionBodyFetched",
         Message::NotionCloseTask => "NotionCloseTask",
         Message::TaskOpenDir => "TaskOpenDir",
         Message::TaskNewDir => "TaskNewDir",

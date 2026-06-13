@@ -32,6 +32,14 @@ pub struct NotionTask {
     pub props: HashMap<String, PropValue>,
 }
 
+/// A simplified page-content block (the task body / "description").
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub kind: String,         // paragraph, heading_1/2/3, bulleted_list_item, numbered_list_item, to_do, quote, code, ...
+    pub text: String,
+    pub checked: Option<bool>, // Some(_) for to_do blocks
+}
+
 fn prop_kind(type_str: &str, def: &serde_json::Value) -> PropKind {
     let opts = |key: &str| def.get(key)
         .and_then(|o| o.get("options"))
@@ -208,6 +216,40 @@ pub async fn list_databases(token: String) -> NotionResult<Vec<NotionDatabase>> 
 pub async fn fetch_schema(token: String, db_id: String) -> NotionResult<NotionDatabase> {
     let v = get(&token, &format!("/databases/{db_id}")).await?;
     parse_database(&v).ok_or_else(|| "could not parse database schema".to_string())
+}
+
+/// Parse a /blocks/{id}/children response into simplified blocks.
+pub fn parse_blocks(v: &serde_json::Value) -> Vec<Block> {
+    v.get("results").and_then(|r| r.as_array()).map(|arr| {
+        arr.iter().filter_map(|b| {
+            let kind = b.get("type")?.as_str()?.to_string();
+            let inner = b.get(&kind);
+            let text = inner
+                .and_then(|o| o.get("rich_text"))
+                .map(|rt| plain_text(rt))
+                .unwrap_or_default();
+            let checked = inner.and_then(|o| o.get("checked")).and_then(|c| c.as_bool());
+            // skip empty non-semantic blocks
+            if text.trim().is_empty() && kind != "divider" { return None; }
+            Some(Block { kind, text, checked })
+        }).collect()
+    }).unwrap_or_default()
+}
+
+pub async fn fetch_blocks(token: String, page_id: String) -> NotionResult<Vec<Block>> {
+    let mut blocks = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut path = format!("/blocks/{page_id}/children?page_size=100");
+        if let Some(c) = &cursor { path.push_str(&format!("&start_cursor={c}")); }
+        let v = get(&token, &path).await?;
+        blocks.extend(parse_blocks(&v));
+        if v.get("has_more").and_then(|h| h.as_bool()) == Some(true) {
+            cursor = v.get("next_cursor").and_then(|c| c.as_str()).map(String::from);
+            if cursor.is_none() { break; }
+        } else { break; }
+    }
+    Ok(blocks)
 }
 
 pub async fn query_tasks(token: String, db_id: String, props: Vec<NotionProp>) -> NotionResult<Vec<NotionTask>> {

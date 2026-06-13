@@ -234,6 +234,7 @@ enum Message {
     NotionRefresh,
     NotionSetGroupBy(String),
     NotionOpenTask(String),
+    OpenTaskBoard(String),
     NotionBodyFetched(String, Result<Vec<notion::Block>, String>),
     NotionCommentsFetched(String, Result<Vec<notion::Comment>, String>),
     CommentInput(String),
@@ -1159,6 +1160,10 @@ impl App {
                 Task::none()
             }
             Message::NotionSetGroupBy(pid) => { self.notion_group_by_prop = Some(pid); self.save_state(); Task::none() }
+            Message::OpenTaskBoard(id) => {
+                self.screen = Screen::Board;
+                return self.update(Message::NotionOpenTask(id));
+            }
             Message::NotionOpenTask(id) => {
                 self.open_task = Some(id.clone());
                 self.open_task_body = Vec::new();
@@ -1999,6 +2004,40 @@ impl App {
         }
         let tip_label = if is_refreshing { "Refreshing…" } else { "Refresh git & deployments" };
         top_row = top_row.push(tip(refresh_btn, tip_label));
+
+        // Affiliated Notion task → compact header card (click → Board + open task)
+        let sess_name = self.projects[pi].sessions[si].name.clone();
+        let sess_path = self.projects[pi].path.clone();
+        let affiliated = self.task_links.iter().find_map(|(tid, links)| {
+            if links.iter().any(|l| l.path == sess_path && l.session_name == sess_name) {
+                let title = self.notion_tasks.iter().find(|t| &t.id == tid)
+                    .map(|t| t.title.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| sess_name.clone());
+                Some((tid.clone(), title))
+            } else { None }
+        });
+        if let Some((tid, title)) = affiliated {
+            let short: String = if title.chars().count() > 42 {
+                format!("{}…", title.chars().take(42).collect::<String>())
+            } else { title };
+            let tcc = tc.clone();
+            top_row = top_row.push(
+                button(row![
+                    text("📋").size(10),
+                    text(short).size(10).color(tc.text_secondary),
+                ].spacing(5).align_y(iced::Alignment::Center))
+                .on_press(Message::OpenTaskBoard(tid))
+                .style(move |_: &Theme, _| button::Style {
+                    background: Some(Background::Color(Color { a: 0.05, ..Color::WHITE })),
+                    text_color: tcc.text_secondary,
+                    border: Border { color: tcc.border, width: 1.0, radius: 5.0.into(), ..Default::default() },
+                    ..Default::default()
+                })
+                .padding([3, 8])
+            );
+        }
+
         top_row = top_row.push(Space::new().width(Fill));
         top_row = top_row.push(text(project.path.display().to_string()).size(9).font(MONO_FONT).color(tc.text_muted));
 
@@ -2580,6 +2619,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::NotionRefresh => "NotionRefresh",
         Message::NotionSetGroupBy(_) => "NotionSetGroupBy",
         Message::NotionOpenTask(_) => "NotionOpenTask",
+        Message::OpenTaskBoard(_) => "OpenTaskBoard",
         Message::NotionBodyFetched(_, _) => "NotionBodyFetched",
         Message::NotionCommentsFetched(_, _) => "NotionCommentsFetched",
         Message::CommentInput(_) => "CommentInput",

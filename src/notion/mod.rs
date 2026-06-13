@@ -162,6 +162,72 @@ fn select_opt(v: &serde_json::Value) -> Option<SelectOption> {
     })
 }
 
+const NOTION_VERSION: &str = "2022-06-28";
+const API: &str = "https://api.notion.com/v1";
+
+pub type NotionResult<T> = Result<T, String>;
+
+async fn post(token: &str, path: &str, body: serde_json::Value) -> NotionResult<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .post(format!("{API}{path}"))
+        .bearer_auth(token)
+        .header("Notion-Version", NOTION_VERSION)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("request failed");
+        return Err(format!("Notion {}: {}", status.as_u16(), msg));
+    }
+    Ok(v)
+}
+
+async fn get(token: &str, path: &str) -> NotionResult<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .get(format!("{API}{path}"))
+        .bearer_auth(token)
+        .header("Notion-Version", NOTION_VERSION)
+        .send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("request failed");
+        return Err(format!("Notion {}: {}", status.as_u16(), msg));
+    }
+    Ok(v)
+}
+
+pub async fn list_databases(token: String) -> NotionResult<Vec<NotionDatabase>> {
+    let body = serde_json::json!({ "filter": { "property": "object", "value": "database" } });
+    let v = post(&token, "/search", body).await?;
+    Ok(parse_databases(&v))
+}
+
+pub async fn fetch_schema(token: String, db_id: String) -> NotionResult<NotionDatabase> {
+    let v = get(&token, &format!("/databases/{db_id}")).await?;
+    parse_database(&v).ok_or_else(|| "could not parse database schema".to_string())
+}
+
+pub async fn query_tasks(token: String, db_id: String, props: Vec<NotionProp>) -> NotionResult<Vec<NotionTask>> {
+    let mut tasks = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut body = serde_json::json!({ "page_size": 100 });
+        if let Some(c) = &cursor { body["start_cursor"] = serde_json::Value::String(c.clone()); }
+        let v = post(&token, &format!("/databases/{db_id}/query"), body).await?;
+        if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
+            for page in arr { if let Some(t) = parse_task(page, &props) { tasks.push(t); } }
+        }
+        if v.get("has_more").and_then(|h| h.as_bool()) == Some(true) {
+            cursor = v.get("next_cursor").and_then(|c| c.as_str()).map(String::from);
+            if cursor.is_none() { break; }
+        } else { break; }
+    }
+    Ok(tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

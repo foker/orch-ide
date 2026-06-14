@@ -71,6 +71,10 @@ pub struct Session {
     pub status_changed_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub color: SessionColor,
+    /// Per-session agent backend override (AgentBackend::as_str). None = use the
+    /// global backend from settings.
+    #[serde(default)]
+    pub backend_override: Option<String>,
     #[serde(default)]
     pub pipeline_run: Option<PipelineRun>,
     /// Set by Tick from the Stop hook payload. Pipeline driver gates auto-advance
@@ -147,6 +151,7 @@ impl Session {
             created_at: now,
             status_changed_at: now,
             color: SessionColor::Grey,
+            backend_override: None,
             pipeline_run: None,
             last_was_question: false,
         }

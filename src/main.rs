@@ -302,6 +302,7 @@ enum Message {
     TaskNewDir,
     TaskDirPicked(Option<PathBuf>),
     TaskNewParentPicked(Option<PathBuf>),
+    SetNewSessionBackend(AgentBackend),
     ReopenTaskLink(usize),
     // Pipelines — settings editor
     AddPipeline,
@@ -362,6 +363,9 @@ struct App {
     open_task: Option<String>,
     open_task_body: Vec<notion::Block>,
     open_task_body_loading: bool,
+    /// Backend chosen in the task detail for the next session created from it
+    /// (defaults to the global settings backend when a task is opened).
+    new_session_backend: AgentBackend,
     open_task_comments: Vec<notion::Comment>,
     comments_loading: bool,
     comment_input: String,
@@ -417,6 +421,7 @@ impl Default for App {
             notion_error: None, notion_loading: false,
             adding_task_col: None, new_task_title: String::new(), creating_task: false,
             screen: Screen::Ide, open_task: None, open_task_body: Vec::new(), open_task_body_loading: false,
+            new_session_backend: AgentBackend::ClaudeCode,
             open_task_comments: Vec::new(), comments_loading: false, comment_input: String::new(), comment_posting: false,
             task_links: std::collections::HashMap::new(),
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
@@ -530,12 +535,16 @@ impl App {
 
     fn spawn_session_terminal(&mut self, pi: usize, si: usize, resume: bool) {
         let session_name = self.projects[pi].sessions[si].name.clone();
-        // Determine program and args (multi-backend: claude / opencode / codex / mimo)
+        // Determine program and args (multi-backend: claude / opencode / codex / mimo).
+        // Per-session override wins over the global settings backend.
+        let backend = self.projects[pi].sessions[si].backend_override.as_deref()
+            .map(AgentBackend::from_str)
+            .unwrap_or(self.agent_backend);
         let claude_path = which_claude();
         let opencode_path = which_opencode();
         let codex_path = which_codex();
         let (program, args) = build_agent_command(
-            self.agent_backend,
+            backend,
             self.launch_agent,
             resume,
             &claude_path,
@@ -1800,6 +1809,7 @@ impl App {
             }
             Message::NotionOpenTask(id) => {
                 self.open_task = Some(id.clone());
+                self.new_session_backend = self.agent_backend; // default to global
                 self.open_task_body = Vec::new();
                 self.open_task_body_loading = true;
                 self.open_task_comments = Vec::new();
@@ -1904,6 +1914,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::SetNewSessionBackend(b) => { self.new_session_backend = b; Task::none() }
             Message::ReopenTaskLink(idx) => {
                 if let Some(task) = self.current_open_task() {
                     if let Some(link) = self.task_links.get(&task.id).and_then(|v| v.get(idx)).cloned() {
@@ -1982,6 +1993,10 @@ impl App {
         }
         self.projects[pi].sessions.push(Session::new(name));
         let si = self.projects[pi].sessions.len() - 1;
+        // apply the backend picked in the task detail (None if it equals global)
+        if self.new_session_backend != self.agent_backend {
+            self.projects[pi].sessions[si].backend_override = Some(self.new_session_backend.as_str().to_string());
+        }
         self.active_project = Some(pi);
         self.active_session = Some((pi, si));
         self.spawn_session_terminal(pi, si, false);
@@ -2643,6 +2658,18 @@ impl App {
                 .on_press(msg).style(button::secondary).width(Fill)
         };
         footer = footer.push(text("New session from this task").size(11).color(tc.text_muted));
+        // Model picker for the new session (defaults to the global settings backend)
+        let mut model_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        model_row = model_row.push(text("Model:").size(10).color(tc.text_muted));
+        for &b in AgentBackend::all() {
+            let active = self.new_session_backend == b;
+            model_row = model_row.push(
+                button(text(b.label()).size(10).color(if active { tc.text_primary } else { tc.text_muted }))
+                    .on_press(Message::SetNewSessionBackend(b))
+                    .style(if active { button::secondary } else { button::text }).padding([2, 8])
+            );
+        }
+        footer = footer.push(model_row);
         footer = footer.push(row![
             action_btn("📂 Open directory", Message::TaskOpenDir),
             action_btn("＋ Create new directory", Message::TaskNewDir),
@@ -3644,6 +3671,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::TaskNewDir => "TaskNewDir",
         Message::TaskDirPicked(_) => "TaskDirPicked",
         Message::TaskNewParentPicked(_) => "TaskNewParentPicked",
+        Message::SetNewSessionBackend(_) => "SetNewSessionBackend",
         Message::ReopenTaskLink(_) => "ReopenTaskLink",
         Message::AddPipeline => "AddPipeline",
         Message::RemovePipeline(_) => "RemovePipeline",

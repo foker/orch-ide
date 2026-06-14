@@ -1958,7 +1958,13 @@ impl App {
 
     /// Find an existing project by path, or create one. Returns its index.
     fn create_or_find_project(&mut self, path: PathBuf) -> usize {
-        if let Some(pi) = self.projects.iter().position(|p| p.path == path) {
+        // Compare canonicalized paths: the folder picker can return a path that
+        // differs from the stored one (macOS /private symlinks, trailing slash),
+        // which would otherwise spawn a duplicate project and "lose" the session.
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Some(pi) = self.projects.iter().position(|p| {
+            std::fs::canonicalize(&p.path).unwrap_or_else(|_| p.path.clone()) == canon
+        }) {
             self.active_project = Some(pi);
             return pi;
         }

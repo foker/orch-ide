@@ -314,6 +314,7 @@ enum Message {
     MovePipelineStep(usize, usize, isize),
     PipelineStepPromptChanged(usize, usize, String),
     TogglePipelineStepInteractive(usize, usize),
+    CyclePipelineStepBackend(usize, usize),
     ToggleEditPipeline(usize),
     // Pipelines — run modal
     OpenRunPipelineModal(usize, usize),
@@ -691,11 +692,16 @@ impl App {
             s.send_delay_ticks = 1;
         }
         let _ = full_prompt; // built lazily inside PipelineSendPrompt
-        let mut args = vec!["--name".to_string(), self.projects[pi].sessions[si].name.clone()];
-        if self.dangerously_skip_permissions {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-        self.spawn_terminal_with(pi, si, claude_path, args);
+        let _ = claude_path; // command built via build_agent_command below
+        // Per-step backend (claude / opencode / codex / mimo), else global.
+        let backend = step.backend.as_deref().map(AgentBackend::from_str).unwrap_or(self.agent_backend);
+        let session_name = self.projects[pi].sessions[si].name.clone();
+        let (program, args) = build_agent_command(
+            backend, true, false,
+            &which_claude(), &which_opencode(), &which_codex(),
+            &session_name, self.dangerously_skip_permissions,
+        );
+        self.spawn_terminal_with(pi, si, program, args);
         Task::perform(
             async { tokio::time::sleep(Duration::from_millis(1500)).await; },
             move |_| Message::PipelineSendPrompt(pi, si),
@@ -1486,6 +1492,19 @@ impl App {
                 if let Some(p) = self.pipelines.get_mut(idx) {
                     if let Some(s) = p.steps.get_mut(step_idx) {
                         s.interactive = !s.interactive;
+                        self.save_state();
+                    }
+                }
+                Task::none()
+            }
+            Message::CyclePipelineStepBackend(idx, step_idx) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    if let Some(s) = p.steps.get_mut(step_idx) {
+                        // None(global) → Claude → OpenCode → Codex → MiMo → None
+                        let order: [Option<&str>; 5] =
+                            [None, Some("ClaudeCode"), Some("OpenCode"), Some("Codex"), Some("XiaomiMimo")];
+                        let cur = order.iter().position(|o| o.map(str::to_string) == s.backend).unwrap_or(0);
+                        s.backend = order[(cur + 1) % order.len()].map(str::to_string);
                         self.save_state();
                     }
                 }
@@ -3332,6 +3351,15 @@ impl App {
                                     .style(button::text).padding([2, 4]),
                                 "Interactive: launches full claude TUI; otherwise headless `claude -p`."
                             ),
+                            tip(
+                                button(text(match step.backend.as_deref() {
+                                    None => "⚙ global".to_string(),
+                                    Some(s) => AgentBackend::from_str(s).label().to_string(),
+                                }).size(9).color(tc.blue))
+                                    .on_press(Message::CyclePipelineStepBackend(idx, s_idx))
+                                    .style(button::text).padding([2, 4]),
+                                "Model for this step (click to cycle; global = settings backend)"
+                            ),
                             button(text("✕").size(10).color(tc.text_muted))
                                 .on_press(Message::RemovePipelineStep(idx, s_idx))
                                 .style(button::text).padding([2, 6]),
@@ -3682,6 +3710,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::MovePipelineStep(_, _, _) => "MovePipelineStep",
         Message::PipelineStepPromptChanged(_, _, _) => "PipelineStepPromptChanged",
         Message::TogglePipelineStepInteractive(_, _) => "TogglePipelineStepInteractive",
+        Message::CyclePipelineStepBackend(_, _) => "CyclePipelineStepBackend",
         Message::ToggleEditPipeline(_) => "ToggleEditPipeline",
         Message::OpenRunPipelineModal(_, _) => "OpenRunPipelineModal",
         Message::ClosePipelineModal => "ClosePipelineModal",

@@ -89,6 +89,9 @@ pub struct PipelineStep {
     pub prompt: String,
     #[serde(default)]
     pub interactive: bool,
+    /// Per-step agent backend (AgentBackend::as_str). None = global settings backend.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

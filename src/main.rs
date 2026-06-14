@@ -3787,8 +3787,14 @@ fn build_agent_command(
         return (sh, vec![]);
     }
     match backend {
+        // opencode has no CLI permission flag — "no restrictions" is configured
+        // in ~/.config/opencode/opencode.jsonc (permission: allow). Same for mimo.
         AgentBackend::OpenCode => (opencode_path.to_string(), vec![]),
-        AgentBackend::Codex => (codex_path.to_string(), vec![]),
+        AgentBackend::Codex => {
+            let mut a = vec![];
+            if skip_perms { a.push("--dangerously-bypass-approvals-and-sandbox".to_string()); }
+            (codex_path.to_string(), a)
+        }
         // Xiaomi MiMo is an OpenAI-compatible provider configured in opencode;
         // launch opencode pinned to the mimo model.
         AgentBackend::XiaomiMimo => (opencode_path.to_string(), vec!["-m".to_string(), MIMO_MODEL.to_string()]),
@@ -4003,10 +4009,20 @@ mod agent_cmd_tests {
     }
 
     #[test]
-    fn codex_runs_bare_in_cwd() {
+    fn codex_bypass_when_skip_perms() {
         let (prog, args) = build_agent_command(
             AgentBackend::Codex, true, false,
             "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+        );
+        assert_eq!(prog, "/bin/codex");
+        assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
+    }
+
+    #[test]
+    fn codex_bare_when_no_skip() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::Codex, true, false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false,
         );
         assert_eq!(prog, "/bin/codex");
         assert!(args.is_empty());

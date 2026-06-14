@@ -168,7 +168,16 @@ impl Backend {
             ..tty::Options::default()
         };
 
-        let config = term::Config::default();
+        // Default alacritty scrollback is 10_000 lines. With 80 cols × ~24 B/cell
+        // that is ~19 MB cloned every time `Backend::sync` copies the grid for
+        // rendering. Under a streaming claude burst (30+ events/s) that became
+        // 600+ MB/s of memory bandwidth and was a major lag driver. 2_000 lines
+        // is still plenty of scrollback for an IDE terminal pane (~25 screens)
+        // and cuts each clone roughly 5×.
+        let config = term::Config {
+            scrolling_history: 2_000,
+            ..term::Config::default()
+        };
         let terminal_size = TerminalSize::default();
         let pty = tty::new(&pty_config, terminal_size.into(), id)?;
 
@@ -206,11 +215,16 @@ impl Backend {
     }
 
     pub fn handle(&mut self, cmd: Command) -> Action {
+        // PERF: do NOT lock `term` unconditionally. The hot path here is
+        // `ProcessAlacrittyEvent(Wakeup)` which fires once per PTY chunk and
+        // does not need term access. Taking the lock just to do nothing while
+        // alacritty's PTY EventLoop (which is producing the events) holds the
+        // same lock in a tight write loop was contending the main UI thread
+        // for hundreds of ms during burst output. Lock lazily, per-command.
         let mut action = Action::default();
-        let term = self.term.clone();
-        let mut term = term.lock();
         match cmd {
             Command::ProcessAlacrittyEvent(event) => {
+                // No term access needed for any of these.
                 match event {
                     Event::Exit => {
                         action = Action::Shutdown;
@@ -226,24 +240,37 @@ impl Backend {
             },
             Command::Write(input) => {
                 self.write(input);
+                let term = self.term.clone();
+                let mut term = term.lock();
                 term.scroll_display(Scroll::Bottom);
             },
             Command::Scroll(delta) => {
+                let term = self.term.clone();
+                let mut term = term.lock();
                 self.scroll(&mut term, delta);
             },
             Command::Resize(layout_size, font_measure) => {
+                let term = self.term.clone();
+                let mut term = term.lock();
                 self.resize(&mut term, layout_size, font_measure);
             },
             Command::SelectStart(selection_type, (x, y)) => {
+                let term = self.term.clone();
+                let mut term = term.lock();
                 self.start_selection(&mut term, selection_type, x, y);
             },
             Command::SelectUpdate((x, y)) => {
+                let term = self.term.clone();
+                let mut term = term.lock();
                 self.update_selection(&mut term, x, y);
             },
             Command::ProcessLink(link_action, point) => {
+                let term = self.term.clone();
+                let term = term.lock();
                 self.process_link_action(&term, link_action, point);
             },
             Command::MouseReport(button, modifiers, point, pressed) => {
+                // Uses self.last_content only, no term needed.
                 self.process_mouse_report(button, modifiers, point, pressed);
             },
         };
@@ -522,9 +549,22 @@ impl Backend {
     }
 
     pub fn sync(&mut self) {
-        let term = self.term.clone();
-        let mut term = term.lock();
-        self.internal_sync(&mut term);
+        // Use `try_lock_unfair` instead of `lock()`. The hot caller is the
+        // 60-fps redraw path on the UI thread; alacritty's PTY EventLoop holds
+        // the same `FairMutex<Term>` while parsing PTY chunks. Under a burst
+        // (claude streaming many KB/s of output) blocking on `lock()` was
+        // pinning the UI thread for multiple SECONDS at a time while waiting
+        // for the EventLoop to release between chunks. Skipping the sync when
+        // the lock is contended means the UI shows the previous frame for one
+        // extra throttle window (~16 ms), then catches up the next time the
+        // lock is free. Visually invisible; functionally the difference between
+        // a usable IDE and an unusable one.
+        let term_arc = self.term.clone();
+        let guard = term_arc.try_lock_unfair();
+        if let Some(mut term) = guard {
+            self.internal_sync(&mut term);
+        }
+        // term_arc dropped after guard; safe.
     }
 
     fn internal_sync(&mut self, terminal: &mut Term<EventProxy>) {

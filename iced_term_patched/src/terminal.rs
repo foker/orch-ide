@@ -37,6 +37,12 @@ pub struct Terminal {
     pub(crate) bindings: BindingsLayout,
     pub(crate) backend: backend::Backend,
     backend_event_rx: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    /// Last time `sync_and_redraw` actually ran. Used to throttle PTY-driven
+    /// syncs to ~60 fps so a burst of alacritty events does not trigger a
+    /// 16-20 MB grid clone per chunk (multiplied by 30+/s during big output
+    /// streams it was burning hundreds of MB/s of memory bandwidth and lagging
+    /// the whole machine).
+    last_sync_at: Option<std::time::Instant>,
 }
 
 impl Terminal {
@@ -58,6 +64,7 @@ impl Terminal {
                 settings.backend,
             )?,
             backend_event_rx: Arc::new(Mutex::new(backend_event_rx)),
+            last_sync_at: None,
         })
     }
 
@@ -93,29 +100,67 @@ impl Terminal {
         action
     }
 
+    /// Foreground terminal: apply + sync. The burst path (alacritty Wakeup on
+    /// PTY output) is throttled to ~60 fps; user input / theme / font sync
+    /// immediately so keystrokes never get stuck inside the throttle window.
     pub fn handle(&mut self, cmd: Command) -> Action {
+        enum SyncKind { FullForce, Throttled, Immediate }
+        let sync_kind = match &cmd {
+            Command::ChangeTheme(_) | Command::ChangeFont(_) => SyncKind::FullForce,
+            Command::ProxyToBackend(backend::Command::ProcessAlacrittyEvent(_)) =>
+                SyncKind::Throttled,
+            _ => SyncKind::Immediate,
+        };
         let action = self.apply(cmd);
-        self.sync_and_redraw();
+        match sync_kind {
+            SyncKind::FullForce => {
+                self.sync_font();
+                self.backend.sync();
+                self.redraw();
+                self.last_sync_at = Some(std::time::Instant::now());
+            },
+            SyncKind::Immediate => {
+                self.backend.sync();
+                self.redraw();
+                self.last_sync_at = Some(std::time::Instant::now());
+            },
+            SyncKind::Throttled => self.throttled_sync_and_redraw(),
+        }
         action
     }
 
     /// Apply a command WITHOUT syncing the render grid or clearing the draw
-    /// cache. Used for background (non-focused) terminals: it keeps the PTY
-    /// responsive (PtyWrite/Exit are still processed) and drains the event,
-    /// but avoids the expensive grid sync + GPU redraw. Call `sync()` when the
-    /// terminal becomes visible again to refresh its rendered content.
+    /// cache. Used for background (non-focused) terminals: keeps the PTY
+    /// responsive (PtyWrite/Exit still processed) and drains the event, but
+    /// avoids the expensive grid sync + GPU redraw entirely. Call `sync()` when
+    /// the terminal is foregrounded to refresh its rendered grid.
     pub fn handle_quiet(&mut self, cmd: Command) -> Action {
         self.apply(cmd)
     }
 
-    /// Force a render-grid sync + redraw (e.g. when a background terminal is
-    /// brought to the foreground after being handled quietly).
+    /// Force an immediate full grid-sync + redraw (e.g. when a background
+    /// terminal is foregrounded after being handled quietly).
     pub fn sync(&mut self) {
-        self.sync_and_redraw();
+        self.sync_font();
+        self.backend.sync();
+        self.redraw();
+        self.last_sync_at = Some(std::time::Instant::now());
     }
 
-    fn sync_and_redraw(&mut self) {
-        self.sync_font();
+    /// Throttle grid-sync + canvas-redraw to ~60 fps. `backend.sync()` clones
+    /// the full alacritty Grid; calling it 100-300x/s during a streaming burst
+    /// saturates RAM bandwidth. Skip when <16 ms since the last sync; the next
+    /// event after the window renders the trailing state.
+    fn throttled_sync_and_redraw(&mut self) {
+        const MIN_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(16);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_sync_at {
+            if now.duration_since(last) < MIN_INTERVAL {
+                return;
+            }
+        }
+        self.last_sync_at = Some(now);
         self.backend.sync();
         self.redraw();
     }
@@ -155,20 +200,31 @@ fn terminal_subscription_stream(
             match event_receiver.recv().await {
                 Some(event) => {
                     if let AlacrittyEvent::Exit = event {
-                        shutdown = true
-                    };
+                        shutdown = true;
+                    }
 
-                    output
+                    if output
                         .send(Event::BackendCall(id, backend::Command::ProcessAlacrittyEvent(event)))
                         .await
-                        .unwrap_or_else(|_| {
-                            panic!("iced_term stream {}: sending BackendEventReceived event is failed", id)
-                        });
+                        .is_err()
+                    {
+                        // Subscriber went away (app shutting down / terminal dropped).
+                        // Exit the loop instead of panicking — drops the receiver lock
+                        // so the backend mutex can be cleaned up.
+                        eprintln!("iced_term stream {}: subscriber gone, exiting", id);
+                        break;
+                    }
                 },
                 None => {
+                    // Channel closed. Always break (whether shutdown was signalled or
+                    // not) — looping on None is a busy-loop that holds the receiver
+                    // lock forever and was a deadlock source. Panicking on
+                    // unexpected-close also took the whole tokio worker down and left
+                    // dangling backend state, causing the UI-thread mutex deadlock.
                     if !shutdown {
-                        panic!("iced_term stream {}: terminal event channel closed unexpected", id);
+                        eprintln!("iced_term stream {}: terminal event channel closed unexpected", id);
                     }
+                    break;
                 },
             }
         }

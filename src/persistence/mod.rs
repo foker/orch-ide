@@ -1,4 +1,4 @@
-use crate::session::ProjectGroup;
+use crate::session::{PipelineDef, ProjectGroup};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +36,8 @@ pub struct AppState {
     /// task id -> folders affiliated with that Notion task
     #[serde(default)]
     pub task_links: HashMap<String, Vec<TaskLink>>,
+    #[serde(default)]
+    pub pipelines: Vec<PipelineDef>,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }
@@ -88,6 +90,7 @@ mod tests {
             notion_group_by_prop: Some("Status".into()),
             agent_backend: "OpenCode".into(),
             task_links: HashMap::new(),
+            pipelines: vec![],
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: AppState = serde_json::from_str(&json).unwrap();

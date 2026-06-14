@@ -73,7 +73,7 @@ impl Drop for PerfGuard {
         let elapsed = self.start.elapsed();
         let us = elapsed.as_micros() as u64;
         metrics::record(&self.label, us);
-        if elapsed.as_millis() > 10 {
+        if elapsed.as_millis() > 5 {
             log(&format!("[PERF] {} took {}ms", self.label, elapsed.as_millis()));
         }
     }

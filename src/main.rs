@@ -9,10 +9,10 @@ mod voice;
 
 use iced::widget::{
     button, column, container, row, scrollable, text,
-    text_input, mouse_area, Column, Row, Space, rule,
+    text_editor, text_input, mouse_area, Column, Row, Space, rule,
 };
 use iced::{Element, Fill, Font, Padding, Subscription, Theme, Color, Border, Background, Task};
-use session::{ProjectGroup, Session, SessionStatus};
+use session::{PipelineDef, PipelineRun, PipelineStep, ProjectGroup, Session, SessionStatus};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,12 +22,41 @@ const APP_VERSION: &str = "0.1.7";
 
 fn main() -> iced::Result {
     logging::init();
+    bootstrap_path();
     iced::application(App::boot, App::update, App::view)
         .title("Claude Sessions")
         .theme(App::theme)
         .subscription(App::subscription)
         .window_size((1200.0, 800.0))
         .run()
+}
+
+/// When the .app is launched from Finder/Spotlight, the process inherits launchd's
+/// stripped PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) — Homebrew/nvm bins are missing.
+/// Resolve the user's login-shell PATH once and pin it on the process so every
+/// child `Command` (gh, git, claude, …) sees the same PATH iTerm would.
+fn bootstrap_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let Ok(out) = std::process::Command::new(&shell)
+        .args(["-lc", "echo -n $PATH"])
+        .output()
+    else {
+        app_log!("bootstrap_path: failed to spawn login shell");
+        return;
+    };
+    if !out.status.success() {
+        app_log!("bootstrap_path: login shell exit={}", out.status);
+        return;
+    }
+    let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if resolved.is_empty() {
+        app_log!("bootstrap_path: empty PATH from login shell");
+        return;
+    }
+    let resolved = prepend_local_bin(resolved);
+    app_log!("bootstrap_path: PATH={}", resolved);
+    // SAFETY: main() is single-threaded at this point — iced hasn't started yet.
+    unsafe { std::env::set_var("PATH", &resolved); }
 }
 
 // ─── Theme System ───
@@ -206,7 +235,9 @@ impl TC {
 enum Message {
     OpenProject, ProjectPicked(Option<PathBuf>),
     NewProject, NewProjectFolderPicked(Option<PathBuf>),
-    AddSession(usize), SessionNameSubmit(usize, String), SessionNameChanged(String),
+    AddSession(usize), NewSessionInCurrentFolder,
+    SessionNameSubmit(usize, String), SessionNameChanged(String),
+    CancelSessionDialog,
     ToggleLaunchClaude,
     SelectSession(usize, usize), KillSession(usize, usize), MakeIdle(usize, usize),
     CardHover(Option<(usize, usize)>),
@@ -238,7 +269,7 @@ enum Message {
     ProjectTerminalsExited(usize), // pi — all terminals stopped, now move to trash in async
     ProjectDirTrashed(usize, Result<(), String>), // pi, result of trash operation
     ResizeSidebar(f32),
-    ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink,
+    ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink, FrameProbe,
     KeyboardEvent(iced::keyboard::Event),
     ToggleSettings, SetTheme(AppTheme),
     TermEvent(iced_term::Event),
@@ -272,6 +303,31 @@ enum Message {
     TaskDirPicked(Option<PathBuf>),
     TaskNewParentPicked(Option<PathBuf>),
     ReopenTaskLink(usize),
+    // Pipelines — settings editor
+    AddPipeline,
+    RemovePipeline(usize),
+    PipelineNameChanged(usize, String),
+    PipelinePrependChanged(usize, String),
+    AddPipelineStep(usize),
+    RemovePipelineStep(usize, usize),
+    MovePipelineStep(usize, usize, isize),
+    PipelineStepPromptChanged(usize, usize, String),
+    TogglePipelineStepInteractive(usize, usize),
+    ToggleEditPipeline(usize),
+    // Pipelines — run modal
+    OpenRunPipelineModal(usize, usize),
+    ClosePipelineModal,
+    SelectPipelineForRun(usize),
+    PipelineRequirementsAction(text_editor::Action),
+    StartPipeline,
+    // Pipelines — execution
+    PipelineSpawnNext(usize, usize),
+    PipelineSendPrompt(usize, usize),
+    PipelineSubmitPrompt(usize, usize),
+    // Pipelines — toolbar controls
+    PipelineNextStep(usize, usize),
+    PipelineJumpToStep(usize, usize, usize),
+    PipelineStop(usize, usize),
 }
 
 // ─── App ───
@@ -336,6 +392,16 @@ struct App {
     // Project is considered "refreshing" while either set contains its index.
     refresh_pending_git: std::collections::HashSet<usize>,
     refresh_pending_deps: std::collections::HashSet<usize>,
+    // Last FrameProbe tick for measuring UI loop jitter (lag spikes show as
+    // delta > probe interval).
+    last_frame_probe: Option<std::time::Instant>,
+    // Pipelines
+    pipelines: Vec<PipelineDef>,
+    editing_pipeline: Option<usize>,
+    // Active "Run pipeline" modal targeting (pi, si).
+    show_pipeline_modal: Option<(usize, usize)>,
+    pipeline_modal_selected: Option<usize>,
+    pipeline_modal_requirements: text_editor::Content,
 }
 
 impl Default for App {
@@ -359,6 +425,12 @@ impl Default for App {
             voice_recorder: voice::AudioRecorder::new(), groq_api_key: String::new(), voice_transcribing: false,
             current_theme: AppTheme::Midnight, sidebar_width: 280.0, date_prefix_enabled: true, hovered_card: None, tick_count: 0, blink_on: true,
             refresh_pending_git: std::collections::HashSet::new(), refresh_pending_deps: std::collections::HashSet::new(),
+            last_frame_probe: None,
+            pipelines: Vec::new(),
+            editing_pipeline: None,
+            show_pipeline_modal: None,
+            pipeline_modal_selected: None,
+            pipeline_modal_requirements: text_editor::Content::new(),
         }
     }
 }
@@ -369,6 +441,18 @@ impl App {
         // Load persisted state
         if let Some(state) = persistence::load() {
             app.projects = state.projects;
+            // Prune garbage ProjectGroups that have no sessions. Sidebar already
+            // hides them (no header is rendered for sessionless projects, see
+            // view_sessions), so they were invisible-but-persistent — every
+            // 📁 Open + Cancel left one behind, eventually piling up to ~90+
+            // entries that all got git+gh-fetched on boot. Pruning here is safe
+            // because the user has no way to interact with them in the UI.
+            let before = app.projects.len();
+            app.projects.retain(|p| !p.sessions.is_empty());
+            let pruned = before - app.projects.len();
+            if pruned > 0 {
+                app_log!("boot: pruned {} sessionless project(s) from state", pruned);
+            }
             // Reset all session statuses to Idle (terminals are dead)
             for p in &mut app.projects {
                 for s in &mut p.sessions {
@@ -394,6 +478,7 @@ impl App {
             app.notion_group_by_prop = state.notion_group_by_prop;
             app.agent_backend = AgentBackend::from_str(&state.agent_backend);
             app.task_links = state.task_links;
+            app.pipelines = state.pipelines;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Show settings if no projects yet
@@ -405,11 +490,19 @@ impl App {
             async { check_latest_version().await },
             Message::UpdateCheckResult,
         );
-        // Populate sub-repo / PR / deployment info for every project in the background
-        // so sidebar cards are not empty on first launch. Each project runs independently —
-        // slow `gh` responses for one project won't block the UI or other projects.
+        // Populate sub-repo / PR / deployment info on boot — but ONLY for projects
+        // that actually have sessions. Empty/abandoned projects (e.g. opened folder
+        // and never created a session) stay dormant: no `gh` API calls, no `git`
+        // subprocesses, no GitInfoFetched message storm hammering the UI thread.
+        // They refresh on demand: SelectSession, RefreshProject, or RefreshAll.
+        //
+        // Before this filter every cold-start fired N=projects.len() parallel
+        // git+gh tasks; with 95 stale entries that was a multi-second UI freeze.
         let mut boot_tasks: Vec<Task<Message>> = vec![check_update];
         for pi in 0..app.projects.len() {
+            if app.projects[pi].sessions.is_empty() {
+                continue;
+            }
             let path = app.projects[pi].path.clone();
             boot_tasks.push(Task::perform(
                 // spawn_blocking: get_git_info_with_pr shells out to git/gh (blocking).
@@ -436,13 +529,8 @@ impl App {
     fn tc(&self) -> TC { self.current_theme.colors() }
 
     fn spawn_session_terminal(&mut self, pi: usize, si: usize, resume: bool) {
-        app_log!("spawn_terminal: pi={} si={} resume={} (active terminals: {})", pi, si, resume, self.terminals.len());
-        let cwd = self.projects[pi].path.clone();
         let session_name = self.projects[pi].sessions[si].name.clone();
-        let tid = self.next_term_id;
-        self.next_term_id += 1;
-
-        // Determine program and args
+        // Determine program and args (multi-backend: claude / opencode / codex / mimo)
         let claude_path = which_claude();
         let opencode_path = which_opencode();
         let codex_path = which_codex();
@@ -456,6 +544,14 @@ impl App {
             &session_name,
             self.dangerously_skip_permissions,
         );
+        self.spawn_terminal_with(pi, si, program, args);
+    }
+
+    fn spawn_terminal_with(&mut self, pi: usize, si: usize, program: String, args: Vec<String>) {
+        app_log!("spawn_terminal: pi={} si={} program={} args={:?} (active terminals: {})", pi, si, program, args, self.terminals.len());
+        let cwd = self.projects[pi].path.clone();
+        let tid = self.next_term_id;
+        self.next_term_id += 1;
 
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
@@ -500,6 +596,140 @@ impl App {
         }
     }
 
+    /// Build the full prompt for a pipeline step.
+    /// `{requirements}` in the template is substituted with the absolute path
+    /// to the project's `.orchpipeline` file. The user-prompt is bracketed by
+    /// (a) the user-editable prepend template and
+    /// (b) a manager-baked suffix that instructs claude to read prior step
+    ///     summaries and write its own at the end.
+    fn build_step_prompt(
+        step_prompt: &str,
+        requirements_path: &std::path::Path,
+        prepend_template: &str,
+        project_path: &std::path::Path,
+        step_idx: usize,
+        total_steps: usize,
+    ) -> String {
+        let prepend = prepend_template.replace("{requirements}", &requirements_path.display().to_string());
+        let summaries_dir = project_path.join(".orchpipeline-summaries");
+        let summary_file = summaries_dir.join(format!("step-{}.md", step_idx + 1));
+        let suffix = format!(
+            "\n\n--- pipeline meta (managed by orch-ide, do not skip) ---\n\
+             You are running step {step_n} of {total} in an automated pipeline.\n\
+             1. BEFORE starting work: list and read every existing summary in `{summaries_dir}/` (files named `step-*.md`). They contain hand-offs from prior steps.\n\
+             2. AFTER finishing work for this step (and BEFORE returning control), write a short summary to `{summary_path}` with this format:\n\
+             ```markdown\n\
+             # Step {step_n} summary\n\
+             ## What was done\n\
+             - <3-6 bullets>\n\
+             ## Key files / commits / branches\n\
+             - <paths, commit shas, PR links>\n\
+             ## Open questions / next-step pointers\n\
+             - <what the next step needs to know — gotchas, scope edges, things you intentionally did not do>\n\
+             ```\n\
+             Create the directory if it does not exist (`mkdir -p {summaries_dir}`). Keep the summary terse — it is read by other claude steps, not by humans.",
+            step_n = step_idx + 1,
+            total = total_steps,
+            summaries_dir = summaries_dir.display(),
+            summary_path = summary_file.display(),
+        );
+        let body = if prepend.trim().is_empty() {
+            step_prompt.to_string()
+        } else {
+            format!("{}\n\n{}", prepend, step_prompt)
+        };
+        format!("{}{}", body, suffix)
+    }
+
+    /// Spawn a terminal for the current step of an in-flight pipeline.
+    /// Non-interactive: claude -p "<prompt>" — runs once and exits.
+    /// Interactive: claude TUI; the prompt is typed in by a follow-up message.
+    fn spawn_pipeline_step(&mut self, pi: usize, si: usize) -> Task<Message> {
+        let Some(run) = self.projects[pi].sessions[si].pipeline_run.as_ref() else {
+            return Task::none();
+        };
+        let Some(step) = run.steps.get(run.current_step).cloned() else {
+            return Task::none();
+        };
+        let req_path = run.requirements_path.clone();
+        let prepend = run.prepend_template.clone();
+        let step_idx = run.current_step;
+        let total = run.steps.len();
+        let project_path = self.projects[pi].path.clone();
+        let full_prompt = Self::build_step_prompt(&step.prompt, &req_path, &prepend, &project_path, step_idx, total);
+        let claude_path = which_claude();
+
+        // Reset hook status so we observe a fresh Running → AwaitingInput edge.
+        let sid = self.projects[pi].sessions[si].id.clone();
+        let status_file = hooks::status_dir().join(&sid).join("status.json");
+        let _ = std::fs::create_dir_all(status_file.parent().unwrap());
+        let _ = std::fs::write(&status_file, r#"{"status":"running"}"#);
+        if let Some(s) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+            s.last_seen_running = false;
+            s.prompt_pending_send = step.interactive;
+            s.send_delay_ticks = if step.interactive { 1 } else { 0 };
+        }
+        self.projects[pi].sessions[si].status = SessionStatus::Running;
+        self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
+
+        // Both modes: full claude TUI, prompt typed in after spawn. Difference is
+        // only in auto-advance — non-interactive moves to next step on
+        // Running→AwaitingInput; interactive waits for the user to click ▶ next.
+        // (Earlier `claude -p` for non-interactive caused blank PTYs because print
+        // mode exits immediately and we lose all output + status hooks.)
+        if let Some(s) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+            s.prompt_pending_send = true;
+            s.send_delay_ticks = 1;
+        }
+        let _ = full_prompt; // built lazily inside PipelineSendPrompt
+        let mut args = vec!["--name".to_string(), self.projects[pi].sessions[si].name.clone()];
+        if self.dangerously_skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        self.spawn_terminal_with(pi, si, claude_path, args);
+        Task::perform(
+            async { tokio::time::sleep(Duration::from_millis(1500)).await; },
+            move |_| Message::PipelineSendPrompt(pi, si),
+        )
+    }
+
+    /// Tear down terminal for (pi, si) and immediately spawn the next pipeline step
+    /// (or finalize if this was the last step).
+    fn advance_pipeline(&mut self, pi: usize, si: usize) -> Task<Message> {
+        // Snapshot current_step + total before mutating.
+        let (current, total) = match self.projects[pi].sessions[si].pipeline_run.as_ref() {
+            Some(r) => (r.current_step, r.steps.len()),
+            None => return Task::none(),
+        };
+        let next = current + 1;
+        if next >= total {
+            // Last step finished — leave terminal alive, clear pipeline_run.
+            app_log!("pipeline finished pi={} si={}", pi, si);
+            self.projects[pi].sessions[si].pipeline_run = None;
+            self.save_state();
+            return Task::none();
+        }
+
+        // Kill current terminal then spawn next step after a brief delay so the
+        // PTY shuts down cleanly before we replace it.
+        if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+            ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                iced_term::backend::Command::Write(b"\x03\x03".to_vec()),
+            ));
+            ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                iced_term::backend::Command::Write(b"exit\n".to_vec()),
+            ));
+        }
+        self.terminals.retain(|(k, _)| *k != (pi, si));
+        if let Some(r) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+            r.current_step = next;
+        }
+        Task::perform(
+            async { tokio::time::sleep(Duration::from_millis(500)).await; },
+            move |_| Message::PipelineSpawnNext(pi, si),
+        )
+    }
+
     fn save_state(&self) {
         persistence::save(&persistence::AppState {
             projects: self.projects.clone(),
@@ -514,6 +744,7 @@ impl App {
             notion_group_by_prop: self.notion_group_by_prop.clone(),
             agent_backend: self.agent_backend.as_str().to_string(),
             task_links: self.task_links.clone(),
+            pipelines: self.pipelines.clone(),
         });
     }
 
@@ -571,7 +802,40 @@ impl App {
                 self.show_session_dialog = Some(pi);
                 iced::widget::operation::focus_next()
             }
+            Message::NewSessionInCurrentFolder => {
+                // Open the session-name dialog for the currently active project,
+                // so a new session is created in the same folder.
+                match self.active_project {
+                    Some(pi) if pi < self.projects.len() => {
+                        self.session_name_input.clear();
+                        self.show_session_dialog = Some(pi);
+                        iced::widget::operation::focus_next()
+                    }
+                    _ => Task::none(),
+                }
+            }
             Message::SessionNameChanged(n) => { self.session_name_input = n; Task::none() }
+            Message::CancelSessionDialog => {
+                // If the dialog was opened by ProjectPicked (📁 Open folder) and
+                // the user is now bailing out before naming a session, the just-
+                // pushed ProjectGroup is invisible garbage (sidebar hides
+                // sessionless projects). Roll it back so state stays clean.
+                // For the "+ add session" flow on an existing project, the project
+                // has >=1 session by definition (it's visible), so the check below
+                // is a no-op there. The usize::MAX flow ("+" new project) doesn't
+                // push until SessionNameSubmit, so nothing to undo either.
+                let to_remove = self.show_session_dialog
+                    .filter(|&pi| pi != usize::MAX
+                        && pi < self.projects.len()
+                        && self.projects[pi].sessions.is_empty());
+                self.session_name_input.clear();
+                self.show_session_dialog = None;
+                self.new_project_parent = None;
+                if let Some(pi) = to_remove {
+                    return self.update(Message::RemoveProject(pi));
+                }
+                Task::none()
+            }
             Message::SessionNameSubmit(pi, name) => {
                 app_log!("SessionNameSubmit: pi={} name={}", pi, name);
                 if !name.is_empty() {
@@ -635,19 +899,27 @@ impl App {
                 self.active_project = Some(pi);
                 self.file_entries = explorer::read_directory(&self.projects[pi].path, 0);
                 self.show_deployment_dropdown = false;
-                // Spawn terminal if it doesn't exist (e.g. after restart)
+                // Spawn terminal if it doesn't exist (e.g. after restart). If the
+                // session has a persisted pipeline_run, resume the current step
+                // rather than doing a plain `claude --continue` so the prompt
+                // gets re-injected and progress tracking stays consistent.
                 let has_term = self.terminals.iter().any(|(k, _)| *k == (pi, si));
+                let has_pipeline = self.projects[pi].sessions[si].pipeline_run.is_some();
+                let mut tasks: Vec<Task<Message>> = Vec::new();
                 if !has_term {
-                    self.spawn_session_terminal(pi, si, true);
+                    if has_pipeline {
+                        tasks.push(self.spawn_pipeline_step(pi, si));
+                    } else {
+                        self.spawn_session_terminal(pi, si, true);
+                    }
                 } else if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
-                    // It was handled quietly while in the background — refresh its
-                    // rendered grid now that it's the focused terminal.
+                    // Foregrounded — refresh its rendered grid (it was handled
+                    // quietly while in the background to save CPU/GPU).
                     ti.terminal.sync();
                 }
-                // Fetch git info + deployments async (non-blocking)
-                let git_task = self.update(Message::FetchGitInfo(pi));
-                let dep_task = self.update(Message::FetchDeployments(pi));
-                return Task::batch([git_task, dep_task]);
+                tasks.push(self.update(Message::FetchGitInfo(pi)));
+                tasks.push(self.update(Message::FetchDeployments(pi)));
+                return Task::batch(tasks);
             }
             Message::MakeIdle(pi, si) => {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
@@ -1058,6 +1330,22 @@ impl App {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 Task::none()
             }
+            Message::FrameProbe => {
+                // Measure delta between probe ticks. Probe fires every 100ms;
+                // a delta noticeably > 100ms means the UI thread was blocked.
+                let now = std::time::Instant::now();
+                if let Some(prev) = self.last_frame_probe {
+                    let delta_ms = now.duration_since(prev).as_millis() as u64;
+                    // Record total delta (raw) so flush shows max — easy to spot freezes.
+                    logging::metrics::record("FrameProbe.delta_ms", delta_ms * 1000);
+                    // Anything past 250ms is a visible stutter — log it eagerly.
+                    if delta_ms > 250 {
+                        app_log!("[FREEZE] UI thread blocked for {}ms", delta_ms);
+                    }
+                }
+                self.last_frame_probe = Some(now);
+                Task::none()
+            }
             Message::KeyboardEvent(event) => {
                 if let iced::keyboard::Event::KeyPressed { key, modifiers, physical_key, .. } = event {
                     if modifiers.command() {
@@ -1066,6 +1354,7 @@ impl App {
                         match latin {
                             Some('o') => return self.update(Message::OpenProject),
                             Some('n') => return self.update(Message::NewProject),
+                            Some('t') => return self.update(Message::NewSessionInCurrentFolder),
                             _ => {}
                         }
                     }
@@ -1074,8 +1363,9 @@ impl App {
             }
             Message::Tick => {
                 // Only check session statuses via hooks (lightweight, no network)
-                for p in &mut self.projects {
-                    for s in &mut p.sessions {
+                let mut advance: Vec<(usize, usize)> = Vec::new();
+                for (pi, p) in self.projects.iter_mut().enumerate() {
+                    for (si, s) in p.sessions.iter_mut().enumerate() {
                         if let Some(pay) = hooks::read_status(&s.id) {
                             if let Some(st) = pay.to_session_status() {
                                 if st != s.status {
@@ -1083,11 +1373,274 @@ impl App {
                                     s.status = st;
                                 }
                             }
+                            s.last_was_question = pay.last_was_question.unwrap_or(false);
+                        }
+                        // Pipeline driver: auto-advance only for non-interactive steps.
+                        // Interactive steps stop the train — the user clicks ▶ Next manually.
+                        // Also block advance when claude's last turn was a question — it's
+                        // asking the user something, not finishing work.
+                        if let Some(run) = s.pipeline_run.as_mut() {
+                            if matches!(s.status, SessionStatus::Running) {
+                                run.last_seen_running = true;
+                            }
+                            if run.prompt_pending_send && run.send_delay_ticks > 0 {
+                                run.send_delay_ticks = run.send_delay_ticks.saturating_sub(1);
+                            }
+                            let current_interactive = run.steps.get(run.current_step)
+                                .map(|st| st.interactive).unwrap_or(false);
+                            let done = !current_interactive
+                                && run.last_seen_running
+                                && !s.last_was_question
+                                && matches!(s.status, SessionStatus::AwaitingInput | SessionStatus::Done);
+                            if done {
+                                advance.push((pi, si));
+                            }
                         }
                     }
                 }
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                for (pi, si) in advance {
+                    tasks.push(self.advance_pipeline(pi, si));
+                }
                 // Dump accumulated perf metrics so we can see what dominates CPU
                 logging::metrics::flush(1);
+                if tasks.is_empty() { Task::none() } else { Task::batch(tasks) }
+            }
+            Message::AddPipeline => {
+                let n = self.pipelines.len() + 1;
+                self.pipelines.push(PipelineDef::new(format!("Pipeline {}", n)));
+                self.editing_pipeline = Some(self.pipelines.len() - 1);
+                self.save_state();
+                Task::none()
+            }
+            Message::RemovePipeline(idx) => {
+                if idx < self.pipelines.len() {
+                    self.pipelines.remove(idx);
+                    if self.editing_pipeline == Some(idx) { self.editing_pipeline = None; }
+                    else if let Some(e) = self.editing_pipeline {
+                        if e > idx { self.editing_pipeline = Some(e - 1); }
+                    }
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::PipelineNameChanged(idx, name) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    p.name = name;
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::PipelinePrependChanged(idx, val) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    p.prepend_template = val;
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::AddPipelineStep(idx) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    p.steps.push(PipelineStep::default());
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::RemovePipelineStep(idx, step_idx) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    if step_idx < p.steps.len() {
+                        p.steps.remove(step_idx);
+                        self.save_state();
+                    }
+                }
+                Task::none()
+            }
+            Message::MovePipelineStep(idx, step_idx, delta) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    let new_idx = step_idx as isize + delta;
+                    if step_idx < p.steps.len() && new_idx >= 0 && (new_idx as usize) < p.steps.len() {
+                        p.steps.swap(step_idx, new_idx as usize);
+                        self.save_state();
+                    }
+                }
+                Task::none()
+            }
+            Message::PipelineStepPromptChanged(idx, step_idx, prompt) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    if let Some(s) = p.steps.get_mut(step_idx) {
+                        s.prompt = prompt;
+                        self.save_state();
+                    }
+                }
+                Task::none()
+            }
+            Message::TogglePipelineStepInteractive(idx, step_idx) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    if let Some(s) = p.steps.get_mut(step_idx) {
+                        s.interactive = !s.interactive;
+                        self.save_state();
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleEditPipeline(idx) => {
+                self.editing_pipeline = if self.editing_pipeline == Some(idx) { None } else { Some(idx) };
+                Task::none()
+            }
+            Message::OpenRunPipelineModal(pi, si) => {
+                self.show_pipeline_modal = Some((pi, si));
+                self.pipeline_modal_selected = if self.pipelines.is_empty() { None } else { Some(0) };
+                self.pipeline_modal_requirements = text_editor::Content::new();
+                Task::none()
+            }
+            Message::ClosePipelineModal => {
+                self.show_pipeline_modal = None;
+                self.pipeline_modal_selected = None;
+                self.pipeline_modal_requirements = text_editor::Content::new();
+                Task::none()
+            }
+            Message::SelectPipelineForRun(idx) => {
+                self.pipeline_modal_selected = Some(idx);
+                Task::none()
+            }
+            Message::PipelineRequirementsAction(action) => {
+                self.pipeline_modal_requirements.perform(action);
+                Task::none()
+            }
+            Message::StartPipeline => {
+                let Some((pi, si)) = self.show_pipeline_modal else { return Task::none(); };
+                let Some(p_idx) = self.pipeline_modal_selected else { return Task::none(); };
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                let Some(pipeline) = self.pipelines.get(p_idx).cloned() else { return Task::none(); };
+                if pipeline.steps.is_empty() { return Task::none(); }
+
+                // Save requirements file at project root.
+                let req_path = self.projects[pi].path.join(".orchpipeline");
+                let req_text = self.pipeline_modal_requirements.text();
+                if let Err(e) = std::fs::write(&req_path, &req_text) {
+                    app_log!("StartPipeline: failed to write {}: {}", req_path.display(), e);
+                    return Task::none();
+                }
+
+                // Kill any existing terminal for this session before driving the pipeline.
+                if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"\x03\x03".to_vec()),
+                    ));
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"exit\n".to_vec()),
+                    ));
+                }
+                self.terminals.retain(|(k, _)| *k != (pi, si));
+
+                self.projects[pi].sessions[si].pipeline_run = Some(PipelineRun {
+                    pipeline_name: pipeline.name.clone(),
+                    steps: pipeline.steps.clone(),
+                    current_step: 0,
+                    requirements_path: req_path,
+                    prepend_template: pipeline.prepend_template.clone(),
+                    last_seen_running: false,
+                    prompt_pending_send: false,
+                    send_delay_ticks: 0,
+                });
+                self.active_session = Some((pi, si));
+                self.active_project = Some(pi);
+                self.show_pipeline_modal = None;
+                self.pipeline_modal_selected = None;
+                self.pipeline_modal_requirements = text_editor::Content::new();
+                self.save_state();
+
+                // Defer spawn slightly so the killed terminal is fully gone.
+                Task::perform(
+                    async { tokio::time::sleep(Duration::from_millis(400)).await; },
+                    move |_| Message::PipelineSpawnNext(pi, si),
+                )
+            }
+            Message::PipelineSpawnNext(pi, si) => {
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                self.spawn_pipeline_step(pi, si)
+            }
+            Message::PipelineSendPrompt(pi, si) => {
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                let Some(run) = self.projects[pi].sessions[si].pipeline_run.as_ref() else {
+                    return Task::none();
+                };
+                let Some(step) = run.steps.get(run.current_step) else { return Task::none(); };
+                let prompt = Self::build_step_prompt(
+                    &step.prompt,
+                    &run.requirements_path,
+                    &run.prepend_template,
+                    &self.projects[pi].path,
+                    run.current_step,
+                    run.steps.len(),
+                );
+                if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    // Bracketed paste so claude TUI treats the whole multi-line
+                    // prompt as one paste block (newlines stay literal). Then a
+                    // separate Enter submits.
+                    let mut bytes = Vec::with_capacity(prompt.len() + 16);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(prompt.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(bytes),
+                    ));
+                    // Schedule the submit (Enter) shortly after so claude has
+                    // a chance to fully ingest the paste block before submit.
+                    let pi_c = pi; let si_c = si;
+                    return Task::perform(
+                        async { tokio::time::sleep(Duration::from_millis(150)).await; },
+                        move |_| Message::PipelineSubmitPrompt(pi_c, si_c),
+                    );
+                }
+                if let Some(r) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+                    r.prompt_pending_send = false;
+                }
+                Task::none()
+            }
+            Message::PipelineSubmitPrompt(pi, si) => {
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"\r".to_vec()),
+                    ));
+                }
+                Task::none()
+            }
+            Message::PipelineNextStep(pi, si) => {
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                self.advance_pipeline(pi, si)
+            }
+            Message::PipelineJumpToStep(pi, si, step_idx) => {
+                if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
+                let total = match self.projects[pi].sessions[si].pipeline_run.as_ref() {
+                    Some(r) => r.steps.len(),
+                    None => return Task::none(),
+                };
+                if step_idx >= total { return Task::none(); }
+
+                // Tear down current terminal, then respawn at requested step.
+                if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"\x03\x03".to_vec()),
+                    ));
+                    ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                        iced_term::backend::Command::Write(b"exit\n".to_vec()),
+                    ));
+                }
+                self.terminals.retain(|(k, _)| *k != (pi, si));
+                if let Some(r) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+                    r.current_step = step_idx;
+                }
+                Task::perform(
+                    async { tokio::time::sleep(Duration::from_millis(500)).await; },
+                    move |_| Message::PipelineSpawnNext(pi, si),
+                )
+            }
+            Message::PipelineStop(pi, si) => {
+                if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
+                    self.projects[pi].sessions[si].pipeline_run = None;
+                    self.save_state();
+                }
                 Task::none()
             }
             Message::RefreshAll => {
@@ -1442,7 +1995,9 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let _guard = logging::perf("view");
         let tc = self.tc();
-        let center = if let Some((pi, ref files)) = self.confirm_delete {
+        let center = if let Some((pi, si)) = self.show_pipeline_modal {
+            self.view_pipeline_modal(pi, si)
+        } else if let Some((pi, ref files)) = self.confirm_delete {
             self.view_confirm_delete(pi, files)
         } else if self.show_settings {
             self.view_settings()
@@ -1517,6 +2072,10 @@ impl App {
                 tip(button(text("◂").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(-40.0)).style(button::text).padding(2), "Shrink"),
                 tip(button(text("▸").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(40.0)).style(button::text).padding(2), "Expand"),
                 tip(button(text("⚙").size(13).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(2), "Settings"),
+                tip(button(text("⊕").size(13).color(tc.text_muted))
+                        .on_press_maybe(self.active_project.filter(|pi| *pi < self.projects.len())
+                            .map(|_| Message::NewSessionInCurrentFolder))
+                        .style(button::text).padding(2), "New session in current folder (⌘T)"),
                 tip(button(text("📁").size(12)).on_press(Message::OpenProject).style(button::text).padding(2), "Open folder (⌘O)"),
                 tip(button(text("+").size(14).color(tc.text_muted)).on_press(Message::NewProject).style(button::text).padding(2), "New project (⌘N)"),
             ].spacing(4).align_y(iced::Alignment::Center),
@@ -1533,7 +2092,16 @@ impl App {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             content = content.push(container(column![
-                text(format!("New project in: {}/", parent_name)).size(11).color(tc.text_secondary),
+                row![
+                    text(format!("New project in: {}/", parent_name)).size(11).color(tc.text_secondary),
+                    Space::new().width(Fill),
+                    tip(
+                        button(text("✕").size(11).color(tc.text_muted))
+                            .on_press(Message::CancelSessionDialog)
+                            .style(button::text).padding([2, 6]),
+                        "Cancel"
+                    ),
+                ].align_y(iced::Alignment::Center),
                 text_input("project-name", &self.session_name_input)
                     .id(SESSION_INPUT_ID)
                     .on_input(Message::SessionNameChanged)
@@ -1559,6 +2127,16 @@ impl App {
                     }
                     color_row
                 },
+                row![
+                    Space::new().width(Fill),
+                    button(text("Cancel").size(11).color(tc.text_secondary))
+                        .on_press(Message::CancelSessionDialog)
+                        .style(button::secondary).padding([4, 12]),
+                    Space::new().width(8),
+                    button(text("Create").size(11).color(tc.green))
+                        .on_press(Message::SessionNameSubmit(usize::MAX, self.session_name_input.clone()))
+                        .style(button::secondary).padding([4, 12]),
+                ].align_y(iced::Alignment::Center),
             ].spacing(4)).padding(8).style({let t = tc.clone(); move |_: &Theme| styled_card(&t)}));
         }
 
@@ -1587,13 +2165,18 @@ impl App {
 
                 // Top row: dot + name + agents + status + kill btn
                 let mut top = Row::new().spacing(6).align_y(iced::Alignment::Center);
-                // Pulsing dot for AWAIT status
+                // Pulsing dot for AWAIT status. While a pipeline is running, swap the
+                // dot for a gear glyph in the same status colour.
                 let dot_color = if session.status == SessionStatus::AwaitingInput && !self.blink_on {
                     Color { a: 0.3, ..sc }
                 } else {
                     sc
                 };
-                top = top.push(text("●").size(8).color(dot_color));
+                if session.pipeline_run.is_some() {
+                    top = top.push(text("⚙").size(12).color(dot_color));
+                } else {
+                    top = top.push(text("●").size(8).color(dot_color));
+                }
                 // Session name: inline rename if double-clicked, otherwise clickable text
                 if self.renaming_session == Some((pi, si)) {
                     top = top.push(
@@ -1685,12 +2268,42 @@ impl App {
                 // Whole-card bg incl. hover (painted by the container, not the inner button)
                 let card_bg = if self.hovered_card == Some((pi, si)) { hover_bg } else { bg_c };
 
-                // Card content (left, fills) — a transparent button for "select"
+                // Pipeline progress bar (built before the card so it can be included).
+                let pipeline_bar: Option<Element<'_, Message>> = session.pipeline_run.as_ref().map(|run| {
+                    let total = run.steps.len().max(1);
+                    let current = run.current_step.min(total - 1);
+                    let label = format!("{} · step {}/{}", run.pipeline_name, current + 1, total);
+                    let bar_color = sc;
+                    let bg_color = Color { a: 0.15, ..bar_color };
+                    let frac = ((current + 1) as f32 / total as f32).clamp(0.0, 1.0);
+                    let total_w = (self.sidebar_width - 60.0).max(80.0);
+                    let filled_w = (total_w * frac).max(2.0);
+                    let bg = container(Space::new().width(filled_w).height(4))
+                        .style(move |_: &Theme| container::Style {
+                            background: Some(Background::Color(bar_color)),
+                            border: Border { radius: 2.0.into(), ..Default::default() },
+                            ..Default::default()
+                        });
+                    let track = container(bg).width(total_w).height(4)
+                        .style(move |_: &Theme| container::Style {
+                            background: Some(Background::Color(bg_color)),
+                            border: Border { radius: 2.0.into(), ..Default::default() },
+                            ..Default::default()
+                        });
+                    column![
+                        text(label).size(9).font(MONO_FONT).color(tc.text_secondary),
+                        track,
+                    ].spacing(3).into()
+                });
+
+                // Card content (left, fills) — a transparent select button
                 let select_btn = button({
                     let mut card_col = Column::new().spacing(6);
                     card_col = card_col.push(top);
                     card_col = card_col.push(meta);
-                    // Color picker when renaming
+                    if let Some(pb) = pipeline_bar {
+                        card_col = card_col.push(pb);
+                    }
                     if self.renaming_session == Some((pi, si)) {
                         let mut color_row = Row::new().spacing(4);
                         for &clr in session::SessionColor::all() {
@@ -1698,7 +2311,7 @@ impl App {
                             let is_selected = session.color == clr;
                             let dot_size = if is_selected { 12 } else { 10 };
                             color_row = color_row.push(
-                                button(text("●").size(dot_size).color(c(r, g, b)))
+                                button(text("\u{25CF}").size(dot_size).color(c(r, g, b)))
                                     .on_press(Message::SetSessionColor(pi, si, clr))
                                     .style(button::text).padding([1, 2])
                             );
@@ -1708,19 +2321,15 @@ impl App {
                     card_col
                 })
                     .on_press(Message::SelectSession(pi, si))
-                    .style(move |_: &Theme, _status: button::Status| {
-                        // Transparent — the card container paints the bg (incl. hover),
-                        // so the rounded corners stay clean and nothing "slides".
-                        button::Style {
-                            background: None,
-                            text_color: Color::WHITE,
-                            ..Default::default()
-                        }
+                    .style(move |_: &Theme, _status: button::Status| button::Style {
+                        background: None,
+                        text_color: Color::WHITE,
+                        ..Default::default()
                     })
                     .padding([10, 12])
                     .width(Fill);
 
-                // Faint vertical separator between content and action buttons
+                // Faint vertical separator between content and actions
                 let sep_color = Color { a: 0.12, ..session_border_color };
                 let separator = container(Space::new().width(1).height(Fill))
                     .style(move |_: &Theme| container::Style {
@@ -1730,15 +2339,19 @@ impl App {
 
                 // Action buttons (right, inside the card)
                 let actions = container(column![
-                    tip(button(text("✕").size(11).color(tc.text_muted))
+                    tip(button(text("\u{2715}").size(11).color(tc.text_muted))
                             .on_press(Message::KillSession(pi, si))
                             .style(button::text).padding([4, 6]),
                         "Kill session"),
-                    tip(button(text("◼").size(9).color(tc.text_muted))
+                    tip(button(text("\u{25FC}").size(9).color(tc.text_muted))
                             .on_press(Message::MakeIdle(pi, si))
                             .style(button::text).padding([4, 6]),
                         "Set idle"),
-                    tip(button(text("🗑").size(9))
+                    tip(button(text("\u{25B6}").size(9).color(tc.blue))
+                            .on_press(Message::OpenRunPipelineModal(pi, si))
+                            .style(button::text).padding([4, 6]),
+                        "Run pipeline"),
+                    tip(button(text("\u{1F5D1}").size(9))
                             .on_press(Message::DeleteProjectDir(pi))
                             .style(button::text).padding([4, 6]),
                         "Delete folder"),
@@ -1782,6 +2395,12 @@ impl App {
                                 text("Launch Claude with this session name").size(11).color(tc.text_secondary),
                             ].spacing(6).align_y(iced::Alignment::Center)
                         ).on_press(Message::ToggleLaunchClaude).style(button::text).padding([2, 0]),
+                        row![
+                            Space::new().width(Fill),
+                            button(text("Cancel").size(11).color(tc.text_secondary))
+                                .on_press(Message::CancelSessionDialog)
+                                .style(button::secondary).padding([4, 12]),
+                        ].align_y(iced::Alignment::Center),
                     ].spacing(4))
                     .padding(Padding { top: 4.0, right: 4.0, bottom: 4.0, left: 20.0 })
                 );
@@ -2332,8 +2951,85 @@ impl App {
         }
         let voice_bar = container(bottom_row);
 
+        // Pipeline control bar (only when this session has an active pipeline run).
+        let pipeline_bar: Option<Element<'_, Message>> = session.pipeline_run.as_ref().map(|run| {
+            let mut bar = Row::new().spacing(8).align_y(iced::Alignment::Center).padding([4, 12]);
+            bar = bar.push(text(format!("⚙ {}", run.pipeline_name)).size(11).font(MONO_FONT).color(tc.text_secondary));
+            // Step chips
+            let mut chips = Row::new().spacing(4);
+            for (idx, step) in run.steps.iter().enumerate() {
+                let is_current = idx == run.current_step;
+                let is_done = idx < run.current_step;
+                let (label_color, bg_color, border_color) = if is_current {
+                    (tc.text_primary, Color { a: 0.18, ..tc.blue }, tc.blue)
+                } else if is_done {
+                    (tc.text_muted, Color { a: 0.05, ..tc.green }, Color { a: 0.4, ..tc.green })
+                } else {
+                    (tc.text_muted, Color { a: 0.04, ..Color::WHITE }, Color { a: 0.15, ..Color::WHITE })
+                };
+                let icon = if step.interactive { "👤" } else { "▸" };
+                let tip_text = format!(
+                    "Step {}: {}{}\nClick to restart from this step.",
+                    idx + 1,
+                    if step.prompt.chars().count() > 60 {
+                        let s: String = step.prompt.chars().take(57).collect();
+                        format!("{}...", s)
+                    } else { step.prompt.clone() },
+                    if step.interactive { " (interactive)" } else { "" },
+                );
+                chips = chips.push(tip(
+                    button(row![
+                        text(icon).size(10),
+                        text(format!("{}", idx + 1)).size(10).font(MONO_FONT).color(label_color),
+                    ].spacing(3).align_y(iced::Alignment::Center))
+                        .on_press(Message::PipelineJumpToStep(pi, si, idx))
+                        .style(move |_: &Theme, _: button::Status| button::Style {
+                            background: Some(Background::Color(bg_color)),
+                            border: Border { color: border_color, width: 1.0, radius: 8.0.into(), ..Default::default() },
+                            text_color: label_color,
+                            ..Default::default()
+                        })
+                        .padding([2, 6]),
+                    &tip_text,
+                ));
+            }
+            bar = bar.push(chips);
+            bar = bar.push(Space::new().width(Fill));
+            // Next-step button (useful especially for interactive steps that don't auto-advance).
+            let has_next = run.current_step + 1 < run.steps.len();
+            let next_color = if has_next { tc.green } else { tc.text_muted };
+            let mut next_btn = button(text("▶ next step").size(10).color(next_color))
+                .style(button::text).padding([2, 6]);
+            if has_next { next_btn = next_btn.on_press(Message::PipelineNextStep(pi, si)); }
+            bar = bar.push(tip(next_btn, "Advance to next step (kills current claude, spawns next)"));
+            // Restart from beginning
+            bar = bar.push(tip(
+                button(text("↻ restart").size(10).color(tc.yellow))
+                    .on_press(Message::PipelineJumpToStep(pi, si, 0))
+                    .style(button::text).padding([2, 6]),
+                "Restart pipeline from step 1",
+            ));
+            // Stop pipeline (leaves current claude alive)
+            bar = bar.push(tip(
+                button(text("✕ stop").size(10).color(tc.red))
+                    .on_press(Message::PipelineStop(pi, si))
+                    .style(button::text).padding([2, 6]),
+                "Stop driving the pipeline (keeps current claude session alive)",
+            ));
+            let bar_tc = tc.clone();
+            container(bar).style(move |_: &Theme| container::Style {
+                background: Some(Background::Color(Color { a: 0.04, ..Color::WHITE })),
+                border: Border { color: bar_tc.border, width: 0.0, ..Default::default() },
+                ..Default::default()
+            }).into()
+        });
+
         let mut main_col = Column::new();
         main_col = main_col.push(info_bar);
+        if let Some(pb) = pipeline_bar {
+            main_col = main_col.push(rule::horizontal(1));
+            main_col = main_col.push(pb);
+        }
         main_col = main_col.push(rule::horizontal(1));
         main_col = main_col.push(terminal_view);
         main_col = main_col.push(voice_bar);
@@ -2535,6 +3231,105 @@ impl App {
             ].spacing(2).align_x(iced::Alignment::End)
         ).padding([8, 20]).width(Fill);
 
+        // Pipelines section
+        let mut pl_section = Column::new().spacing(6);
+        pl_section = pl_section.push(text("Pipelines").size(12).color(tc.text_muted));
+        pl_section = pl_section.push(
+            text("Define ordered prompt sequences. \"Run pipeline\" on a card writes its requirements to <project>/.orchpipeline and steps run in order.")
+                .size(10).color(tc.text_muted)
+        );
+        for (idx, p) in self.pipelines.iter().enumerate() {
+            let expanded = self.editing_pipeline == Some(idx);
+            let chevron = if expanded { "▾" } else { "▸" };
+            let mut card = Column::new().spacing(6);
+            card = card.push(
+                row![
+                    button(text(chevron).size(11).color(tc.text_muted))
+                        .on_press(Message::ToggleEditPipeline(idx))
+                        .style(button::text).padding([2, 6]),
+                    text_input("pipeline name", &p.name)
+                        .on_input(move |s| Message::PipelineNameChanged(idx, s))
+                        .size(12).padding(4),
+                    text(format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" }))
+                        .size(10).color(tc.text_muted),
+                    button(text("✕").size(10).color(tc.text_muted))
+                        .on_press(Message::RemovePipeline(idx))
+                        .style(button::text).padding([2, 6]),
+                ].spacing(6).align_y(iced::Alignment::Center)
+            );
+            if expanded {
+                let mut steps_col = Column::new().spacing(4).padding([4, 16]);
+                steps_col = steps_col.push(
+                    text("Prepend to each step's prompt").size(10).color(tc.text_muted)
+                );
+                steps_col = steps_col.push(
+                    text_input("prepend (use {requirements} for the .orchpipeline path)", &p.prepend_template)
+                        .on_input(move |s| Message::PipelinePrependChanged(idx, s))
+                        .size(11).padding(4)
+                );
+                steps_col = steps_col.push(
+                    text("{requirements} is replaced with the absolute path to <project>/.orchpipeline at run time. Leave blank to disable prepending.")
+                        .size(9).color(tc.text_muted)
+                );
+                steps_col = steps_col.push(Space::new().height(8));
+                let last_idx = p.steps.len().saturating_sub(1);
+                for (s_idx, step) in p.steps.iter().enumerate() {
+                    let check = if step.interactive { "☑" } else { "☐" };
+                    let check_color = if step.interactive { tc.green } else { tc.text_muted };
+                    let can_up = s_idx > 0;
+                    let can_down = s_idx < last_idx;
+                    let up_color = if can_up { tc.text_secondary } else { Color { a: 0.3, ..tc.text_muted } };
+                    let down_color = if can_down { tc.text_secondary } else { Color { a: 0.3, ..tc.text_muted } };
+                    let mut up_btn = button(text("↑").size(11).color(up_color))
+                        .style(button::text).padding([2, 4]);
+                    if can_up { up_btn = up_btn.on_press(Message::MovePipelineStep(idx, s_idx, -1)); }
+                    let mut down_btn = button(text("↓").size(11).color(down_color))
+                        .style(button::text).padding([2, 4]);
+                    if can_down { down_btn = down_btn.on_press(Message::MovePipelineStep(idx, s_idx, 1)); }
+                    steps_col = steps_col.push(
+                        row![
+                            column![
+                                tip(up_btn, "Move step up"),
+                                tip(down_btn, "Move step down"),
+                            ].spacing(0),
+                            text(format!("{}.", s_idx + 1)).size(10).color(tc.text_muted),
+                            text_input("prompt for this step", &step.prompt)
+                                .on_input(move |s| Message::PipelineStepPromptChanged(idx, s_idx, s))
+                                .size(11).padding(4),
+                            tip(
+                                button(row![
+                                    text(check).size(12).color(check_color),
+                                    text("interactive").size(10).color(tc.text_secondary),
+                                ].spacing(4).align_y(iced::Alignment::Center))
+                                    .on_press(Message::TogglePipelineStepInteractive(idx, s_idx))
+                                    .style(button::text).padding([2, 4]),
+                                "Interactive: launches full claude TUI; otherwise headless `claude -p`."
+                            ),
+                            button(text("✕").size(10).color(tc.text_muted))
+                                .on_press(Message::RemovePipelineStep(idx, s_idx))
+                                .style(button::text).padding([2, 6]),
+                        ].spacing(6).align_y(iced::Alignment::Center)
+                    );
+                }
+                steps_col = steps_col.push(
+                    button(text("+ add step").size(10).color(tc.blue))
+                        .on_press(Message::AddPipelineStep(idx))
+                        .style(button::text).padding([2, 4])
+                );
+                card = card.push(steps_col);
+            }
+            let card_tc = tc.clone();
+            pl_section = pl_section.push(
+                container(card).padding(8)
+                    .style(move |_: &Theme| styled_card(&card_tc))
+            );
+        }
+        pl_section = pl_section.push(
+            button(text("+ new pipeline").size(11).color(tc.blue))
+                .on_press(Message::AddPipeline)
+                .style(button::text).padding([4, 8])
+        );
+
         container(column![
             header, rule::horizontal(1),
             scrollable(column![
@@ -2546,6 +3341,8 @@ impl App {
                 themes,
                 Space::new().height(16),
                 qp_section,
+                Space::new().height(16),
+                pl_section,
                 Space::new().height(16),
                 options_section,
             ].spacing(8).padding([16, 20])).height(Fill),
@@ -2598,12 +3395,96 @@ impl App {
         container(content).center(Fill).height(Fill).into()
     }
 
+    fn view_pipeline_modal(&self, pi: usize, si: usize) -> Element<'_, Message> {
+        let tc = self.tc();
+        let session_name = self.projects.get(pi)
+            .and_then(|p| p.sessions.get(si))
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
+        let mut content = Column::new().spacing(14).padding(24).max_width(640);
+        content = content.push(text("Run Pipeline").size(18).color(tc.text_primary));
+        content = content.push(text(format!("Session: {}", session_name)).size(11).color(tc.text_muted));
+
+        // Pipeline picker
+        if self.pipelines.is_empty() {
+            content = content.push(
+                text("No pipelines defined yet — open Settings → Pipelines to add one.")
+                    .size(12).color(tc.orange)
+            );
+        } else {
+            content = content.push(text("Pipeline").size(11).color(tc.text_muted));
+            let mut list = Column::new().spacing(4);
+            for (idx, p) in self.pipelines.iter().enumerate() {
+                let selected = self.pipeline_modal_selected == Some(idx);
+                let icon = if selected { "◉" } else { "○" };
+                let icon_color = if selected { tc.blue } else { tc.text_muted };
+                list = list.push(
+                    button(row![
+                        text(icon).size(14).color(icon_color),
+                        text(p.name.clone()).size(12).color(tc.text_primary),
+                        Space::new().width(Fill),
+                        text(format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" }))
+                            .size(10).color(tc.text_muted),
+                    ].spacing(8).align_y(iced::Alignment::Center))
+                    .on_press(Message::SelectPipelineForRun(idx))
+                    .style(if selected { button::secondary } else { button::text })
+                    .padding([6, 10]).width(Fill)
+                );
+            }
+            content = content.push(list);
+        }
+
+        // Requirements (multi-line; Enter inserts a newline, click Start to submit)
+        content = content.push(Space::new().height(8));
+        content = content.push(text("Requirements (saved to .orchpipeline)").size(11).color(tc.text_muted));
+        content = content.push(
+            container(
+                text_editor(&self.pipeline_modal_requirements)
+                    .placeholder("Describe what the pipeline should accomplish... (Enter for newline)")
+                    .on_action(Message::PipelineRequirementsAction)
+                    .size(12)
+                    .padding(8)
+                    .height(220)
+            )
+        );
+        content = content.push(
+            text(".orchpipeline lives at <project>/.orchpipeline. Each step receives a pointer to it as the first line of its prompt.")
+                .size(10).color(tc.text_muted)
+        );
+
+        // Buttons
+        let can_start = self.pipeline_modal_selected.is_some()
+            && self.pipelines.get(self.pipeline_modal_selected.unwrap_or(0))
+                .map(|p| !p.steps.is_empty())
+                .unwrap_or(false);
+        let mut start_btn = button(text("Start").size(13).color(if can_start { tc.green } else { tc.text_muted }))
+            .style(button::secondary)
+            .padding([8, 20]);
+        if can_start {
+            start_btn = start_btn.on_press(Message::StartPipeline);
+        }
+        content = content.push(
+            row![
+                button(text("Cancel").size(13).color(tc.text_primary))
+                    .on_press(Message::ClosePipelineModal)
+                    .style(button::secondary)
+                    .padding([8, 20]),
+                Space::new().width(12),
+                start_btn,
+            ]
+        );
+        let _ = pi; let _ = si;
+        container(content).center(Fill).height(Fill).into()
+    }
+
     fn theme(&self) -> Theme { Theme::Dark }
 
     fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![
             iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::FrameProbe),
         ];
         // Subscribe to every terminal, not just the active one.
         //
@@ -2684,8 +3565,10 @@ fn message_label(m: &Message) -> &'static str {
         Message::NewProject => "NewProject",
         Message::NewProjectFolderPicked(_) => "NewProjectFolderPicked",
         Message::AddSession(_) => "AddSession",
+        Message::NewSessionInCurrentFolder => "NewSessionInCurrentFolder",
         Message::SessionNameSubmit(_, _) => "SessionNameSubmit",
         Message::SessionNameChanged(_) => "SessionNameChanged",
+        Message::CancelSessionDialog => "CancelSessionDialog",
         Message::ToggleLaunchClaude => "ToggleLaunchClaude",
         Message::SelectSession(_, _) => "SelectSession",
         Message::KillSession(_, _) => "KillSession",
@@ -2729,6 +3612,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::RefreshAll => "RefreshAll",
         Message::Tick => "Tick",
         Message::Blink => "Blink",
+        Message::FrameProbe => "FrameProbe",
         Message::KeyboardEvent(_) => "KeyboardEvent",
         Message::ToggleSettings => "ToggleSettings",
         Message::SetTheme(_) => "SetTheme",
@@ -2761,6 +3645,27 @@ fn message_label(m: &Message) -> &'static str {
         Message::TaskDirPicked(_) => "TaskDirPicked",
         Message::TaskNewParentPicked(_) => "TaskNewParentPicked",
         Message::ReopenTaskLink(_) => "ReopenTaskLink",
+        Message::AddPipeline => "AddPipeline",
+        Message::RemovePipeline(_) => "RemovePipeline",
+        Message::PipelineNameChanged(_, _) => "PipelineNameChanged",
+        Message::PipelinePrependChanged(_, _) => "PipelinePrependChanged",
+        Message::AddPipelineStep(_) => "AddPipelineStep",
+        Message::RemovePipelineStep(_, _) => "RemovePipelineStep",
+        Message::MovePipelineStep(_, _, _) => "MovePipelineStep",
+        Message::PipelineStepPromptChanged(_, _, _) => "PipelineStepPromptChanged",
+        Message::TogglePipelineStepInteractive(_, _) => "TogglePipelineStepInteractive",
+        Message::ToggleEditPipeline(_) => "ToggleEditPipeline",
+        Message::OpenRunPipelineModal(_, _) => "OpenRunPipelineModal",
+        Message::ClosePipelineModal => "ClosePipelineModal",
+        Message::SelectPipelineForRun(_) => "SelectPipelineForRun",
+        Message::PipelineRequirementsAction(_) => "PipelineRequirementsAction",
+        Message::StartPipeline => "StartPipeline",
+        Message::PipelineSpawnNext(_, _) => "PipelineSpawnNext",
+        Message::PipelineSendPrompt(_, _) => "PipelineSendPrompt",
+        Message::PipelineSubmitPrompt(_, _) => "PipelineSubmitPrompt",
+        Message::PipelineNextStep(_, _) => "PipelineNextStep",
+        Message::PipelineJumpToStep(_, _, _) => "PipelineJumpToStep",
+        Message::PipelineStop(_, _) => "PipelineStop",
     }
 }
 

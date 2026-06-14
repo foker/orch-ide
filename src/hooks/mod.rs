@@ -12,6 +12,11 @@ pub struct StatusPayload {
     #[serde(rename = "totalSteps")]
     pub total_steps: Option<u32>,
     pub etc: Option<String>,
+    /// Set by Stop hook when claude's last assistant message ended with `?`.
+    /// Pipeline driver uses this to skip auto-advance when claude is asking
+    /// the user something rather than finishing work.
+    #[serde(rename = "lastWasQuestion", default)]
+    pub last_was_question: Option<bool>,
 }
 
 impl StatusPayload {
@@ -63,10 +68,52 @@ TN=""
 
 w() {{ printf '{{"status":"%s","currentTask":"%s","lastUpdate":"%s"}}' "$1" "$2" "$NOW" > "$SF"; }}
 ws() {{ printf '{{"status":"%s","lastUpdate":"%s"}}' "$1" "$NOW" > "$SF"; }}
+ws_q() {{ printf '{{"status":"%s","lastUpdate":"%s","lastWasQuestion":%s}}' "$1" "$NOW" "$2" > "$SF"; }}
 
 case "$E" in
   PostToolUse) w "running" "Tool: ${{TN:-working}}" ;;
-  Stop) ws "awaiting-input" ;;
+  Stop)
+    TRANSCRIPT=""
+    [ -n "$INPUT" ] && TRANSCRIPT=$(echo "$INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null || true)
+    LWQ="false"
+    if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+      LWQ=$(python3 -c "
+import json, re, sys
+last_text = None
+try:
+    with open('$TRANSCRIPT', 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get('type') != 'assistant': continue
+            msg = d.get('message') or {{}}
+            content = msg.get('content', [])
+            text_parts = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        text_parts.append(item.get('text', ''))
+            elif isinstance(content, str):
+                text_parts.append(content)
+            joined = ''.join(text_parts).strip()
+            if joined:
+                last_text = joined
+except Exception:
+    pass
+if last_text:
+    # Strip trailing whitespace + bracketed/parenthetical asides; check if ends with ?
+    stripped = re.sub(r'[\s\)\]\*_\.]+\$', '', last_text)
+    print('true' if stripped.endswith('?') else 'false')
+else:
+    print('false')
+" 2>/dev/null || echo "false")
+    fi
+    ws_q "awaiting-input" "$LWQ"
+    ;;
   UserPromptSubmit) w "running" "Processing prompt..." ;;
   Notification)
     MSG=$(echo "$INPUT" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null || true)

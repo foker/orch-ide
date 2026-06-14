@@ -1682,6 +1682,8 @@ impl App {
                 };
                 let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
                 let hover_bg = t.bg_card_hover;
+                // Whole-card bg incl. hover (painted by the container, not the inner button)
+                let card_bg = if self.hovered_card == Some((pi, si)) { hover_bg } else { bg_c };
 
                 // Card content (left, fills) — a transparent button for "select"
                 let select_btn = button({
@@ -1706,13 +1708,11 @@ impl App {
                     card_col
                 })
                     .on_press(Message::SelectSession(pi, si))
-                    .style(move |_: &Theme, status: button::Status| {
-                        let bg = match status {
-                            button::Status::Hovered | button::Status::Pressed => hover_bg,
-                            _ => Color::TRANSPARENT,
-                        };
+                    .style(move |_: &Theme, _status: button::Status| {
+                        // Transparent — the card container paints the bg (incl. hover),
+                        // so the rounded corners stay clean and nothing "slides".
                         button::Style {
-                            background: Some(Background::Color(bg)),
+                            background: None,
                             text_color: Color::WHITE,
                             ..Default::default()
                         }
@@ -1749,7 +1749,7 @@ impl App {
                     row![select_btn, separator, actions].align_y(iced::Alignment::Center)
                 )
                 .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(bg_c)),
+                    background: Some(Background::Color(card_bg)),
                     border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
                     ..Default::default()
                 })
@@ -1758,7 +1758,7 @@ impl App {
                 content = content.push(
                     mouse_area(
                         container(card_row)
-                            .padding(Padding { top: 2.0, right: 0.0, bottom: 2.0, left: 12.0 })
+                            .padding(Padding { top: 2.0, right: 12.0, bottom: 2.0, left: 12.0 })
                     )
                     .on_enter(Message::CardHover(Some((pi, si))))
                     .on_exit(Message::CardHover(None))

@@ -104,6 +104,10 @@ pub struct PipelineDef {
     /// absolute path to the project's `.orchpipeline` file at run time.
     #[serde(default = "default_prepend_template")]
     pub prepend_template: String,
+    /// Appended to every step's prompt (after the step text, before the managed
+    /// pipeline-meta suffix). Blank = nothing appended.
+    #[serde(default)]
+    pub append_template: String,
 }
 
 pub fn default_prepend_template() -> String {
@@ -117,6 +121,7 @@ impl PipelineDef {
             name,
             steps: Vec::new(),
             prepend_template: default_prepend_template(),
+            append_template: String::new(),
         }
     }
 }
@@ -134,6 +139,8 @@ pub struct PipelineRun {
     /// stable even if the user edits the pipeline definition mid-run.
     #[serde(default = "default_prepend_template")]
     pub prepend_template: String,
+    #[serde(default)]
+    pub append_template: String,
     #[serde(skip, default)]
     pub last_seen_running: bool,
     #[serde(skip, default)]

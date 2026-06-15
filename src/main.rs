@@ -276,6 +276,7 @@ enum Message {
     RemovePipeline(usize),
     PipelineNameChanged(usize, String),
     PipelinePrependChanged(usize, String),
+    PipelineAppendChanged(usize, String),
     AddPipelineStep(usize),
     RemovePipelineStep(usize, usize),
     MovePipelineStep(usize, usize, isize),
@@ -588,11 +589,13 @@ impl App {
         step_prompt: &str,
         requirements_path: &std::path::Path,
         prepend_template: &str,
+        append_template: &str,
         project_path: &std::path::Path,
         step_idx: usize,
         total_steps: usize,
     ) -> String {
         let prepend = prepend_template.replace("{requirements}", &requirements_path.display().to_string());
+        let append = append_template.replace("{requirements}", &requirements_path.display().to_string());
         let summaries_dir = project_path.join(".orchpipeline-summaries");
         let summary_file = summaries_dir.join(format!("step-{}.md", step_idx + 1));
         let suffix = format!(
@@ -615,11 +618,14 @@ impl App {
             summaries_dir = summaries_dir.display(),
             summary_path = summary_file.display(),
         );
-        let body = if prepend.trim().is_empty() {
+        let mut body = if prepend.trim().is_empty() {
             step_prompt.to_string()
         } else {
             format!("{}\n\n{}", prepend, step_prompt)
         };
+        if !append.trim().is_empty() {
+            body = format!("{}\n\n{}", body, append);
+        }
         format!("{}{}", body, suffix)
     }
 
@@ -635,10 +641,11 @@ impl App {
         };
         let req_path = run.requirements_path.clone();
         let prepend = run.prepend_template.clone();
+        let append = run.append_template.clone();
         let step_idx = run.current_step;
         let total = run.steps.len();
         let project_path = self.projects[pi].path.clone();
-        let full_prompt = Self::build_step_prompt(&step.prompt, &req_path, &prepend, &project_path, step_idx, total);
+        let full_prompt = Self::build_step_prompt(&step.prompt, &req_path, &prepend, &append, &project_path, step_idx, total);
         let claude_path = which_claude();
 
         // Reset hook status so we observe a fresh Running → AwaitingInput edge.
@@ -1426,6 +1433,13 @@ impl App {
                 }
                 Task::none()
             }
+            Message::PipelineAppendChanged(idx, val) => {
+                if let Some(p) = self.pipelines.get_mut(idx) {
+                    p.append_template = val;
+                    self.save_state();
+                }
+                Task::none()
+            }
             Message::AddPipelineStep(idx) => {
                 if let Some(p) = self.pipelines.get_mut(idx) {
                     p.steps.push(PipelineStep::default());
@@ -1539,6 +1553,7 @@ impl App {
                     current_step: 0,
                     requirements_path: req_path,
                     prepend_template: pipeline.prepend_template.clone(),
+                    append_template: pipeline.append_template.clone(),
                     last_seen_running: false,
                     prompt_pending_send: false,
                     send_delay_ticks: 0,
@@ -1570,6 +1585,7 @@ impl App {
                     &step.prompt,
                     &run.requirements_path,
                     &run.prepend_template,
+                    &run.append_template,
                     &self.projects[pi].path,
                     run.current_step,
                     run.steps.len(),
@@ -3108,7 +3124,7 @@ impl App {
 
         let header = container(
             row![
-                text("SETTINGS").size(14).color(tc.text_primary),
+                text("SETTINGS").size(18).color(tc.text_primary),
                 Space::new().width(Fill),
                 button(text("✕").size(14).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(4),
             ].align_y(iced::Alignment::Center),
@@ -3164,7 +3180,7 @@ impl App {
                 .style(button::text).padding([4, 0])
             },
             Space::new().height(12),
-            text("Voice Input (Groq Whisper)").size(12).color(tc.text_muted),
+            text("Voice Input (Groq Whisper)").size(15).color(tc.text_secondary),
             text_input("Groq API key...", &self.groq_api_key)
                 .on_input(Message::GroqKeyChanged)
                 .size(12).padding(6),
@@ -3173,7 +3189,7 @@ impl App {
 
         // Quick prompts section
         let mut qp_section = Column::new().spacing(4);
-        qp_section = qp_section.push(text("Quick Prompts").size(12).color(tc.text_muted));
+        qp_section = qp_section.push(text("Quick Prompts").size(15).color(tc.text_secondary));
         for (i, prompt) in self.quick_prompts.iter().enumerate() {
             qp_section = qp_section.push(
                 row![
@@ -3208,7 +3224,7 @@ impl App {
             );
         }
         let agent_section = column![
-            text("Agent Backend").size(12).color(tc.text_muted),
+            text("Agent Backend").size(15).color(tc.text_secondary),
             backend_row,
             text("Only Claude Code has live status tracking (hooks). OpenCode / Codex /").size(9).color(tc.text_muted),
             text("Xiaomi MiMo run their own TUI; MiMo = opencode pinned to mimo-v2.5-pro.").size(9).color(tc.text_muted),
@@ -3216,7 +3232,7 @@ impl App {
 
         // Notion section
         let mut notion_section = Column::new().spacing(6);
-        notion_section = notion_section.push(text("Notion").size(12).color(tc.text_muted));
+        notion_section = notion_section.push(text("Notion").size(15).color(tc.text_secondary));
         notion_section = notion_section.push(
             text_input("Notion integration token (secret_...)", &self.notion_token)
                 .on_input(Message::NotionTokenChanged)
@@ -3258,7 +3274,7 @@ impl App {
 
         // Pipelines section
         let mut pl_section = Column::new().spacing(6);
-        pl_section = pl_section.push(text("Pipelines").size(12).color(tc.text_muted));
+        pl_section = pl_section.push(text("Pipelines").size(15).color(tc.text_secondary));
         pl_section = pl_section.push(
             text("Define ordered prompt sequences. \"Run pipeline\" on a card writes its requirements to <project>/.orchpipeline and steps run in order.")
                 .size(10).color(tc.text_muted)
@@ -3283,9 +3299,11 @@ impl App {
                 ].spacing(6).align_y(iced::Alignment::Center)
             );
             if expanded {
-                let mut steps_col = Column::new().spacing(4).padding([4, 16]);
+                // Extra left padding so steps read as nested under the pipeline.
+                let mut steps_col = Column::new().spacing(4)
+                    .padding(Padding { top: 4.0, right: 8.0, bottom: 4.0, left: 32.0 });
                 steps_col = steps_col.push(
-                    text("Prepend to each step's prompt").size(10).color(tc.text_muted)
+                    text("Prepend to each step's prompt").size(11).color(tc.text_secondary)
                 );
                 steps_col = steps_col.push(
                     text_input("prepend (use {requirements} for the .orchpipeline path)", &p.prepend_template)
@@ -3339,6 +3357,24 @@ impl App {
                                     .style(button::text).padding([2, 4]),
                                 "Model for this step (click to cycle; global = settings backend)"
                             ),
+                            {
+                                // Preview of the final prompt that goes to the agent
+                                // (prepend + step + append; the managed pipeline-meta
+                                // suffix is added on top at run time).
+                                let mut preview = String::new();
+                                if !p.prepend_template.trim().is_empty() {
+                                    preview.push_str(p.prepend_template.trim()); preview.push_str("\n\n");
+                                }
+                                preview.push_str(if step.prompt.trim().is_empty() { "(empty step prompt)" } else { step.prompt.trim() });
+                                if !p.append_template.trim().is_empty() {
+                                    preview.push_str("\n\n"); preview.push_str(p.append_template.trim());
+                                }
+                                preview.push_str("\n\n+ [orch-ide pipeline-meta suffix added at run time]");
+                                tip(
+                                    text("👁").size(11),
+                                    &preview
+                                )
+                            },
                             button(text("✕").size(10).color(tc.text_muted))
                                 .on_press(Message::RemovePipelineStep(idx, s_idx))
                                 .style(button::text).padding([2, 6]),
@@ -3349,6 +3385,15 @@ impl App {
                     button(text("+ add step").size(10).color(tc.blue))
                         .on_press(Message::AddPipelineStep(idx))
                         .style(button::text).padding([2, 4])
+                );
+                steps_col = steps_col.push(Space::new().height(8));
+                steps_col = steps_col.push(
+                    text("Append to each step's prompt").size(11).color(tc.text_secondary)
+                );
+                steps_col = steps_col.push(
+                    text_input("append (use {requirements} for the .orchpipeline path)", &p.append_template)
+                        .on_input(move |s| Message::PipelineAppendChanged(idx, s))
+                        .size(11).padding(4)
                 );
                 card = card.push(steps_col);
             }
@@ -3371,7 +3416,7 @@ impl App {
                 Space::new().height(16),
                 notion_section,
                 Space::new().height(16),
-                text("Color Theme").size(12).color(tc.text_muted),
+                text("Color Theme").size(15).color(tc.text_secondary),
                 themes,
                 Space::new().height(16),
                 qp_section,
@@ -3684,6 +3729,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::RemovePipeline(_) => "RemovePipeline",
         Message::PipelineNameChanged(_, _) => "PipelineNameChanged",
         Message::PipelinePrependChanged(_, _) => "PipelinePrependChanged",
+        Message::PipelineAppendChanged(_, _) => "PipelineAppendChanged",
         Message::AddPipelineStep(_) => "AddPipelineStep",
         Message::RemovePipelineStep(_, _) => "RemovePipelineStep",
         Message::MovePipelineStep(_, _, _) => "MovePipelineStep",

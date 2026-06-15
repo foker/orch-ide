@@ -277,6 +277,9 @@ enum Message {
     PipelineNameChanged(usize, String),
     PipelinePrependChanged(usize, String),
     PipelineAppendChanged(usize, String),
+    PipelinePrependAction(usize, text_editor::Action),
+    PipelineAppendAction(usize, text_editor::Action),
+    PipelineStepPromptAction(usize, usize, text_editor::Action),
     AddPipelineStep(usize),
     RemovePipelineStep(usize, usize),
     MovePipelineStep(usize, usize, isize),
@@ -303,6 +306,17 @@ enum Message {
 // ─── App ───
 
 struct TerminalInstance { terminal: iced_term::Terminal, id: u64 }
+
+/// Multiline editor buffers for the pipeline editor (text_editor needs a
+/// `Content` per field). Rebuilt from `App.pipelines` on every structural change
+/// (add/remove/move step, add/remove pipeline, toggle edit); mutated in place
+/// while typing. Keyed by pipeline index, and (pipeline, step) for step prompts.
+#[derive(Default)]
+struct PipelineEditors {
+    prepend: std::collections::HashMap<usize, text_editor::Content>,
+    append: std::collections::HashMap<usize, text_editor::Content>,
+    steps: std::collections::HashMap<(usize, usize), text_editor::Content>,
+}
 
 struct App {
     projects: Vec<ProjectGroup>,
@@ -340,6 +354,8 @@ struct App {
     comment_input: String,
     comment_posting: bool,
     task_links: std::collections::HashMap<String, Vec<persistence::TaskLink>>,
+    pipeline_editors: PipelineEditors,
+    editor_fallback: text_editor::Content,
     show_settings: bool,
     confirm_delete: Option<(usize, Vec<String>)>,
     renaming_session: Option<(usize, usize)>,
@@ -393,6 +409,8 @@ impl Default for App {
             new_session_backend: AgentBackend::ClaudeCode,
             open_task_comments: Vec::new(), comments_loading: false, comment_input: String::new(), comment_posting: false,
             task_links: std::collections::HashMap::new(),
+            pipeline_editors: PipelineEditors::default(),
+            editor_fallback: text_editor::Content::new(),
             show_settings: false, confirm_delete: None, renaming_session: None, rename_input: String::new(), new_session_color: session::SessionColor::Grey,
             show_deployment_dropdown: false,
             dangerously_skip_permissions: true, quick_prompts: Vec::new(), quick_prompt_input: String::new(), update_available: None,
@@ -455,6 +473,7 @@ impl App {
             app.pipelines = state.pipelines;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
+        app.sync_pipeline_editors();
         // Show settings if no projects yet
         if app.projects.is_empty() {
             app.show_settings = true;
@@ -585,6 +604,22 @@ impl App {
     /// (a) the user-editable prepend template and
     /// (b) a manager-baked suffix that instructs claude to read prior step
     ///     summaries and write its own at the end.
+    /// Rebuild the multiline editor buffers from the current pipelines. Call
+    /// after any structural change (add/remove/move step, add/remove pipeline).
+    fn sync_pipeline_editors(&mut self) {
+        let mut prepend = std::collections::HashMap::new();
+        let mut append = std::collections::HashMap::new();
+        let mut steps = std::collections::HashMap::new();
+        for (pi, p) in self.pipelines.iter().enumerate() {
+            prepend.insert(pi, text_editor::Content::with_text(&p.prepend_template));
+            append.insert(pi, text_editor::Content::with_text(&p.append_template));
+            for (si, st) in p.steps.iter().enumerate() {
+                steps.insert((pi, si), text_editor::Content::with_text(&st.prompt));
+            }
+        }
+        self.pipeline_editors = PipelineEditors { prepend, append, steps };
+    }
+
     fn build_step_prompt(
         step_prompt: &str,
         requirements_path: &std::path::Path,
@@ -1406,6 +1441,7 @@ impl App {
                 self.pipelines.push(PipelineDef::new(format!("Pipeline {}", n)));
                 self.editing_pipeline = Some(self.pipelines.len() - 1);
                 self.save_state();
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::RemovePipeline(idx) => {
@@ -1417,6 +1453,7 @@ impl App {
                     }
                     self.save_state();
                 }
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::PipelineNameChanged(idx, name) => {
@@ -1440,11 +1477,44 @@ impl App {
                 }
                 Task::none()
             }
+            Message::PipelinePrependAction(idx, action) => {
+                if let Some(c) = self.pipeline_editors.prepend.get_mut(&idx) {
+                    c.perform(action);
+                    let mut txt = c.text();
+                    if txt.ends_with('\n') { txt.pop(); }
+                    if let Some(p) = self.pipelines.get_mut(idx) { p.prepend_template = txt; }
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::PipelineAppendAction(idx, action) => {
+                if let Some(c) = self.pipeline_editors.append.get_mut(&idx) {
+                    c.perform(action);
+                    let mut txt = c.text();
+                    if txt.ends_with('\n') { txt.pop(); }
+                    if let Some(p) = self.pipelines.get_mut(idx) { p.append_template = txt; }
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::PipelineStepPromptAction(idx, step_idx, action) => {
+                if let Some(c) = self.pipeline_editors.steps.get_mut(&(idx, step_idx)) {
+                    c.perform(action);
+                    let mut txt = c.text();
+                    if txt.ends_with('\n') { txt.pop(); }
+                    if let Some(p) = self.pipelines.get_mut(idx) {
+                        if let Some(st) = p.steps.get_mut(step_idx) { st.prompt = txt; }
+                    }
+                    self.save_state();
+                }
+                Task::none()
+            }
             Message::AddPipelineStep(idx) => {
                 if let Some(p) = self.pipelines.get_mut(idx) {
                     p.steps.push(PipelineStep::default());
                     self.save_state();
                 }
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::RemovePipelineStep(idx, step_idx) => {
@@ -1454,6 +1524,7 @@ impl App {
                         self.save_state();
                     }
                 }
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::MovePipelineStep(idx, step_idx, delta) => {
@@ -1464,6 +1535,7 @@ impl App {
                         self.save_state();
                     }
                 }
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::PipelineStepPromptChanged(idx, step_idx, prompt) => {
@@ -1499,6 +1571,7 @@ impl App {
             }
             Message::ToggleEditPipeline(idx) => {
                 self.editing_pipeline = if self.editing_pipeline == Some(idx) { None } else { Some(idx) };
+                self.sync_pipeline_editors();
                 Task::none()
             }
             Message::OpenRunPipelineModal(pi, si) => {
@@ -3305,11 +3378,14 @@ impl App {
                 steps_col = steps_col.push(
                     text("Prepend to each step's prompt").size(11).color(tc.text_secondary)
                 );
-                steps_col = steps_col.push(
-                    text_input("prepend (use {requirements} for the .orchpipeline path)", &p.prepend_template)
-                        .on_input(move |s| Message::PipelinePrependChanged(idx, s))
-                        .size(11).padding(4)
-                );
+                {
+                    let cc = self.pipeline_editors.prepend.get(&idx).unwrap_or(&self.editor_fallback);
+                    steps_col = steps_col.push(
+                        text_editor(cc)
+                            .on_action(move |a| Message::PipelinePrependAction(idx, a))
+                            .size(11).padding(6).height(ed_height(cc))
+                    );
+                }
                 steps_col = steps_col.push(
                     text("{requirements} is replaced with the absolute path to <project>/.orchpipeline at run time. Leave blank to disable prepending.")
                         .size(9).color(tc.text_muted)
@@ -3336,9 +3412,12 @@ impl App {
                                 tip(down_btn, "Move step down"),
                             ].spacing(0),
                             text(format!("{}.", s_idx + 1)).size(10).color(tc.text_muted),
-                            text_input("prompt for this step", &step.prompt)
-                                .on_input(move |s| Message::PipelineStepPromptChanged(idx, s_idx, s))
-                                .size(11).padding(4),
+                            {
+                                let cc = self.pipeline_editors.steps.get(&(idx, s_idx)).unwrap_or(&self.editor_fallback);
+                                text_editor(cc)
+                                    .on_action(move |a| Message::PipelineStepPromptAction(idx, s_idx, a))
+                                    .size(11).padding(6).height(ed_height(cc))
+                            },
                             tip(
                                 button(row![
                                     text(check).size(12).color(check_color),
@@ -3390,11 +3469,14 @@ impl App {
                 steps_col = steps_col.push(
                     text("Append to each step's prompt").size(11).color(tc.text_secondary)
                 );
-                steps_col = steps_col.push(
-                    text_input("append (use {requirements} for the .orchpipeline path)", &p.append_template)
-                        .on_input(move |s| Message::PipelineAppendChanged(idx, s))
-                        .size(11).padding(4)
-                );
+                {
+                    let cc = self.pipeline_editors.append.get(&idx).unwrap_or(&self.editor_fallback);
+                    steps_col = steps_col.push(
+                        text_editor(cc)
+                            .on_action(move |a| Message::PipelineAppendAction(idx, a))
+                            .size(11).padding(6).height(ed_height(cc))
+                    );
+                }
                 card = card.push(steps_col);
             }
             let card_tc = tc.clone();
@@ -3588,6 +3670,12 @@ impl App {
 
 // ─── Styled helpers ───
 
+/// Auto-grow height for a multiline editor based on its line count (capped).
+fn ed_height(c: &text_editor::Content) -> f32 {
+    let lines = c.line_count().max(1);
+    (lines as f32 * 17.0 + 16.0).clamp(34.0, 280.0)
+}
+
 fn styled_panel(tc: &TC) -> container::Style {
     container::Style {
         background: Some(Background::Color(tc.bg_panel)),
@@ -3730,6 +3818,9 @@ fn message_label(m: &Message) -> &'static str {
         Message::PipelineNameChanged(_, _) => "PipelineNameChanged",
         Message::PipelinePrependChanged(_, _) => "PipelinePrependChanged",
         Message::PipelineAppendChanged(_, _) => "PipelineAppendChanged",
+        Message::PipelinePrependAction(_, _) => "PipelinePrependAction",
+        Message::PipelineAppendAction(_, _) => "PipelineAppendAction",
+        Message::PipelineStepPromptAction(_, _, _) => "PipelineStepPromptAction",
         Message::AddPipelineStep(_) => "AddPipelineStep",
         Message::RemovePipelineStep(_, _) => "RemovePipelineStep",
         Message::MovePipelineStep(_, _, _) => "MovePipelineStep",

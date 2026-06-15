@@ -37,12 +37,6 @@ pub struct Terminal {
     pub(crate) bindings: BindingsLayout,
     pub(crate) backend: backend::Backend,
     backend_event_rx: Arc<Mutex<Receiver<AlacrittyEvent>>>,
-    /// Last time `sync_and_redraw` actually ran. Used to throttle PTY-driven
-    /// syncs to ~60 fps so a burst of alacritty events does not trigger a
-    /// 16-20 MB grid clone per chunk (multiplied by 30+/s during big output
-    /// streams it was burning hundreds of MB/s of memory bandwidth and lagging
-    /// the whole machine).
-    last_sync_at: Option<std::time::Instant>,
 }
 
 impl Terminal {
@@ -64,7 +58,6 @@ impl Terminal {
                 settings.backend,
             )?,
             backend_event_rx: Arc::new(Mutex::new(backend_event_rx)),
-            last_sync_at: None,
         })
     }
 
@@ -100,32 +93,23 @@ impl Terminal {
         action
     }
 
-    /// Foreground terminal: apply + sync. The burst path (alacritty Wakeup on
-    /// PTY output) is throttled to ~60 fps; user input / theme / font sync
-    /// immediately so keystrokes never get stuck inside the throttle window.
+    /// Foreground terminal: apply + sync immediately on every event.
+    ///
+    /// No throttling: the old 60 fps throttle dropped the *trailing* sync when a
+    /// burst ended inside the 16 ms window, leaving the last chunk of output
+    /// unrendered until the next (possibly never) event — that read as lag /
+    /// stale frames. The throttle existed because every terminal synced; now
+    /// `handle_quiet` keeps background terminals out of the sync path entirely,
+    /// so only the single focused terminal syncs per event and the per-event
+    /// cost is bounded. Font/theme changes additionally re-shape the font.
     pub fn handle(&mut self, cmd: Command) -> Action {
-        enum SyncKind { FullForce, Throttled, Immediate }
-        let sync_kind = match &cmd {
-            Command::ChangeTheme(_) | Command::ChangeFont(_) => SyncKind::FullForce,
-            Command::ProxyToBackend(backend::Command::ProcessAlacrittyEvent(_)) =>
-                SyncKind::Throttled,
-            _ => SyncKind::Immediate,
-        };
+        let full = matches!(&cmd, Command::ChangeTheme(_) | Command::ChangeFont(_));
         let action = self.apply(cmd);
-        match sync_kind {
-            SyncKind::FullForce => {
-                self.sync_font();
-                self.backend.sync();
-                self.redraw();
-                self.last_sync_at = Some(std::time::Instant::now());
-            },
-            SyncKind::Immediate => {
-                self.backend.sync();
-                self.redraw();
-                self.last_sync_at = Some(std::time::Instant::now());
-            },
-            SyncKind::Throttled => self.throttled_sync_and_redraw(),
+        if full {
+            self.sync_font();
         }
+        self.backend.sync();
+        self.redraw();
         action
     }
 
@@ -138,29 +122,10 @@ impl Terminal {
         self.apply(cmd)
     }
 
-    /// Force an immediate full grid-sync + redraw (e.g. when a background
-    /// terminal is foregrounded after being handled quietly).
+    /// Force a full grid-sync + redraw (e.g. when a background terminal is
+    /// foregrounded after being handled quietly).
     pub fn sync(&mut self) {
         self.sync_font();
-        self.backend.sync();
-        self.redraw();
-        self.last_sync_at = Some(std::time::Instant::now());
-    }
-
-    /// Throttle grid-sync + canvas-redraw to ~60 fps. `backend.sync()` clones
-    /// the full alacritty Grid; calling it 100-300x/s during a streaming burst
-    /// saturates RAM bandwidth. Skip when <16 ms since the last sync; the next
-    /// event after the window renders the trailing state.
-    fn throttled_sync_and_redraw(&mut self) {
-        const MIN_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(16);
-        let now = std::time::Instant::now();
-        if let Some(last) = self.last_sync_at {
-            if now.duration_since(last) < MIN_INTERVAL {
-                return;
-            }
-        }
-        self.last_sync_at = Some(now);
         self.backend.sync();
         self.redraw();
     }

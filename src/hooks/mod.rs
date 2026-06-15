@@ -46,6 +46,15 @@ pub fn read_status(session_id: &str) -> Option<StatusPayload> {
 }
 
 /// Create hook script for a session
+/// Read the claude session id captured by the hook for this OrchIDE session,
+/// so we can resume the exact conversation via `claude --resume <id>`.
+pub fn read_claude_session_id(session_id: &str) -> Option<String> {
+    let path = status_dir().join(session_id).join("claude_session");
+    let s = std::fs::read_to_string(path).ok()?;
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
 pub fn create_hook_script(session_id: &str) -> Result<PathBuf, std::io::Error> {
     let dir = status_dir().join(session_id);
     std::fs::create_dir_all(&dir)?;
@@ -65,6 +74,18 @@ INPUT=""
 
 TN=""
 [ -n "$INPUT" ] && TN=$(echo "$INPUT" | grep -o '"tool_name":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null || true)
+
+# Capture the claude session id (transcript filename, no .jsonl) so OrchIDE can
+# resume THIS exact conversation via `claude --resume <id>` instead of the
+# ambiguous `claude --continue` (which only restores the most-recent convo in
+# the directory and loses the right session when several run per project).
+if [ -n "$INPUT" ]; then
+  TP=$(echo "$INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null || true)
+  if [ -n "$TP" ]; then
+    CSID=$(basename "$TP" .jsonl)
+    [ -n "$CSID" ] && printf '%s' "$CSID" > "${{SF%/*}}/claude_session"
+  fi
+fi
 
 w() {{ printf '{{"status":"%s","currentTask":"%s","lastUpdate":"%s"}}' "$1" "$2" "$NOW" > "$SF"; }}
 ws() {{ printf '{{"status":"%s","lastUpdate":"%s"}}' "$1" "$NOW" > "$SF"; }}

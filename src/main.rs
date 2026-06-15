@@ -508,6 +508,10 @@ impl App {
         let backend = self.projects[pi].sessions[si].backend_override.as_deref()
             .map(AgentBackend::from_str)
             .unwrap_or(self.agent_backend);
+        // On resume, prefer the exact claude conversation captured by the hook.
+        let claude_resume_id = if resume {
+            hooks::read_claude_session_id(&self.projects[pi].sessions[si].id)
+        } else { None };
         let claude_path = which_claude();
         let opencode_path = which_opencode();
         let codex_path = which_codex();
@@ -520,6 +524,7 @@ impl App {
             &codex_path,
             &session_name,
             self.dangerously_skip_permissions,
+            claude_resume_id.as_deref(),
         );
         self.spawn_terminal_with(pi, si, program, args);
     }
@@ -667,6 +672,7 @@ impl App {
             backend, true, false,
             &which_claude(), &which_opencode(), &which_codex(),
             &session_name, self.dangerously_skip_permissions,
+            None,
         );
         self.spawn_terminal_with(pi, si, program, args);
         Task::perform(

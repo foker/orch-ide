@@ -50,6 +50,7 @@ pub fn build_agent_command(
     codex_path: &str,
     session_name: &str,
     skip_perms: bool,
+    claude_resume_id: Option<&str>,
 ) -> (String, Vec<String>) {
     if !launch_agent {
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -70,10 +71,19 @@ pub fn build_agent_command(
         AgentBackend::ClaudeCode => {
             let skip_flag = if skip_perms { " --dangerously-skip-permissions" } else { "" };
             if resume {
+                let esc_name = session_name.replace('\'', "'\\''");
+                // Prefer resuming the exact conversation by its claude session id
+                // (captured by the Stop hook). Fall back to --continue, then a
+                // fresh named session.
+                let primary = match claude_resume_id {
+                    Some(id) if !id.is_empty() => {
+                        format!("{} --resume '{}'{}", claude_path, id.replace('\'', "'\\''"), skip_flag)
+                    }
+                    _ => format!("{} --continue{}", claude_path, skip_flag),
+                };
                 let cmd = format!(
-                    "{} --continue{} 2>/dev/null || {} --name '{}'{}",
-                    claude_path, skip_flag, claude_path,
-                    session_name.replace('\'', "'\\''"), skip_flag
+                    "{} 2>/dev/null || {} --continue{} 2>/dev/null || {} --name '{}'{}",
+                    primary, claude_path, skip_flag, claude_path, esc_name, skip_flag
                 );
                 ("/bin/sh".to_string(), vec!["-c".to_string(), cmd])
             } else {
@@ -191,7 +201,7 @@ mod agent_cmd_tests {
     fn claude_fresh_uses_name_flag() {
         let (prog, args) = build_agent_command(
             AgentBackend::ClaudeCode, true, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true, None,
         );
         assert_eq!(prog, "/bin/claude");
         assert_eq!(args, vec!["--name", "my task", "--dangerously-skip-permissions"]);
@@ -201,7 +211,7 @@ mod agent_cmd_tests {
     fn claude_resume_uses_continue_shell() {
         let (prog, args) = build_agent_command(
             AgentBackend::ClaudeCode, true, true,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false, None,
         );
         assert_eq!(prog, "/bin/sh");
         assert_eq!(args[0], "-c");
@@ -209,10 +219,22 @@ mod agent_cmd_tests {
     }
 
     #[test]
+    fn claude_resume_by_id_uses_resume_then_falls_back() {
+        let (prog, args) = build_agent_command(
+            AgentBackend::ClaudeCode, true, true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false,
+            Some("abc123-uuid"),
+        );
+        assert_eq!(prog, "/bin/sh");
+        assert!(args[1].contains("--resume 'abc123-uuid'"));
+        assert!(args[1].contains("--continue")); // fallback chain
+    }
+
+    #[test]
     fn opencode_runs_bare_in_cwd() {
         let (prog, args) = build_agent_command(
             AgentBackend::OpenCode, true, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true, None,
         );
         assert_eq!(prog, "/bin/opencode");
         assert!(args.is_empty());
@@ -222,7 +244,7 @@ mod agent_cmd_tests {
     fn codex_bypass_when_skip_perms() {
         let (prog, args) = build_agent_command(
             AgentBackend::Codex, true, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true, None,
         );
         assert_eq!(prog, "/bin/codex");
         assert_eq!(args, vec!["--dangerously-bypass-approvals-and-sandbox"]);
@@ -232,7 +254,7 @@ mod agent_cmd_tests {
     fn codex_bare_when_no_skip() {
         let (prog, args) = build_agent_command(
             AgentBackend::Codex, true, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", false, None,
         );
         assert_eq!(prog, "/bin/codex");
         assert!(args.is_empty());
@@ -242,7 +264,7 @@ mod agent_cmd_tests {
     fn mimo_runs_opencode_with_model() {
         let (prog, args) = build_agent_command(
             AgentBackend::XiaomiMimo, true, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "my task", true, None,
         );
         assert_eq!(prog, "/bin/opencode");
         assert_eq!(args, vec!["-m", "mimo/mimo-v2.5-pro"]);
@@ -252,7 +274,7 @@ mod agent_cmd_tests {
     fn plain_shell_when_agent_off() {
         let (prog, _args) = build_agent_command(
             AgentBackend::ClaudeCode, false, false,
-            "/bin/claude", "/bin/opencode", "/bin/codex", "x", true,
+            "/bin/claude", "/bin/opencode", "/bin/codex", "x", true, None,
         );
         assert!(prog.ends_with("sh") || prog.ends_with("zsh") || prog.contains("/"));
     }

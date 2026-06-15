@@ -104,14 +104,35 @@ pub struct PipelineDef {
     /// absolute path to the project's `.orchpipeline` file at run time.
     #[serde(default = "default_prepend_template")]
     pub prepend_template: String,
-    /// Appended to every step's prompt (after the step text, before the managed
-    /// pipeline-meta suffix). Blank = nothing appended.
-    #[serde(default)]
+    /// Appended to every step's prompt (after the step text). Seeded with the
+    /// pipeline-meta scaffolding so the whole prompt is visible/editable.
+    #[serde(default = "default_append_template")]
     pub append_template: String,
 }
 
 pub fn default_prepend_template() -> String {
     "The main requirements content is in this file: {requirements}".to_string()
+}
+
+/// Default text appended to every step's prompt. Previously this was baked into
+/// the code (invisible); it now lives in the editable append template so the
+/// full prompt is visible. Tokens {step_n} {total} {summaries_dir}
+/// {summary_path} {requirements} are expanded at run time.
+pub fn default_append_template() -> String {
+    r#"--- pipeline meta (managed by orch-ide, do not skip) ---
+You are running step {step_n} of {total} in an automated pipeline.
+1. BEFORE starting work: list and read every existing summary in `{summaries_dir}/` (files named `step-*.md`). They contain hand-offs from prior steps.
+2. AFTER finishing work for this step (and BEFORE returning control), write a short summary to `{summary_path}` with this format:
+```markdown
+# Step {step_n} summary
+## What was done
+- <3-6 bullets>
+## Key files / commits / branches
+- <paths, commit shas, PR links>
+## Open questions / next-step pointers
+- <what the next step needs to know — gotchas, scope edges, things you intentionally did not do>
+```
+Create the directory if it does not exist (`mkdir -p {summaries_dir}`). Keep the summary terse — it is read by other claude steps, not by humans."#.to_string()
 }
 
 impl PipelineDef {
@@ -121,7 +142,7 @@ impl PipelineDef {
             name,
             steps: Vec::new(),
             prepend_template: default_prepend_template(),
-            append_template: String::new(),
+            append_template: default_append_template(),
         }
     }
 }
@@ -139,7 +160,7 @@ pub struct PipelineRun {
     /// stable even if the user edits the pipeline definition mid-run.
     #[serde(default = "default_prepend_template")]
     pub prepend_template: String,
-    #[serde(default)]
+    #[serde(default = "default_append_template")]
     pub append_template: String,
     #[serde(skip, default)]
     pub last_seen_running: bool,

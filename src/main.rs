@@ -629,30 +629,20 @@ impl App {
         step_idx: usize,
         total_steps: usize,
     ) -> String {
-        let prepend = prepend_template.replace("{requirements}", &requirements_path.display().to_string());
-        let append = append_template.replace("{requirements}", &requirements_path.display().to_string());
+        // Expand all template tokens in both prepend and append. The pipeline-meta
+        // scaffolding now lives in the (editable, visible) append template rather
+        // than being hidden in code, so the whole prompt is WYSIWYG.
         let summaries_dir = project_path.join(".orchpipeline-summaries");
         let summary_file = summaries_dir.join(format!("step-{}.md", step_idx + 1));
-        let suffix = format!(
-            "\n\n--- pipeline meta (managed by orch-ide, do not skip) ---\n\
-             You are running step {step_n} of {total} in an automated pipeline.\n\
-             1. BEFORE starting work: list and read every existing summary in `{summaries_dir}/` (files named `step-*.md`). They contain hand-offs from prior steps.\n\
-             2. AFTER finishing work for this step (and BEFORE returning control), write a short summary to `{summary_path}` with this format:\n\
-             ```markdown\n\
-             # Step {step_n} summary\n\
-             ## What was done\n\
-             - <3-6 bullets>\n\
-             ## Key files / commits / branches\n\
-             - <paths, commit shas, PR links>\n\
-             ## Open questions / next-step pointers\n\
-             - <what the next step needs to know — gotchas, scope edges, things you intentionally did not do>\n\
-             ```\n\
-             Create the directory if it does not exist (`mkdir -p {summaries_dir}`). Keep the summary terse — it is read by other claude steps, not by humans.",
-            step_n = step_idx + 1,
-            total = total_steps,
-            summaries_dir = summaries_dir.display(),
-            summary_path = summary_file.display(),
-        );
+        let expand = |t: &str| {
+            t.replace("{requirements}", &requirements_path.display().to_string())
+                .replace("{step_n}", &(step_idx + 1).to_string())
+                .replace("{total}", &total_steps.to_string())
+                .replace("{summaries_dir}", &summaries_dir.display().to_string())
+                .replace("{summary_path}", &summary_file.display().to_string())
+        };
+        let prepend = expand(prepend_template);
+        let append = expand(append_template);
         let mut body = if prepend.trim().is_empty() {
             step_prompt.to_string()
         } else {
@@ -661,7 +651,7 @@ impl App {
         if !append.trim().is_empty() {
             body = format!("{}\n\n{}", body, append);
         }
-        format!("{}{}", body, suffix)
+        body
     }
 
     /// Spawn a terminal for the current step of an in-flight pipeline.
@@ -3448,7 +3438,6 @@ impl App {
                                 if !p.append_template.trim().is_empty() {
                                     preview.push_str("\n\n"); preview.push_str(p.append_template.trim());
                                 }
-                                preview.push_str("\n\n+ [orch-ide pipeline-meta suffix added at run time]");
                                 tip(
                                     text("👁").size(11),
                                     &preview

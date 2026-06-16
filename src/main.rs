@@ -20,7 +20,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.1.7";
+const APP_VERSION: &str = "0.2.0";
 
 fn main() -> iced::Result {
     logging::init();

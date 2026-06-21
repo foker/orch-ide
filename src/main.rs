@@ -69,6 +69,10 @@ enum AppTheme { Midnight, VsCode, Darcula, GitHub, Monokai, Catppuccin }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen { Ide, Board }
 
+/// Where transcribed voice text is inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceTarget { Terminal, PipelineRequirements }
+
 
 impl AppTheme {
     fn all() -> &'static [AppTheme] {
@@ -291,6 +295,7 @@ enum Message {
     OpenRunPipelineModal(usize, usize),
     ClosePipelineModal,
     SelectPipelineForRun(usize),
+    TogglePipelineModalStep(usize),
     PipelineRequirementsAction(text_editor::Action),
     StartPipeline,
     // Pipelines — execution
@@ -391,6 +396,10 @@ struct App {
     show_pipeline_modal: Option<(usize, usize)>,
     pipeline_modal_selected: Option<usize>,
     pipeline_modal_requirements: text_editor::Content,
+    /// Per-step enable flags for the run modal (this run only); length tracks the
+    /// selected pipeline's step count.
+    pipeline_modal_steps: Vec<bool>,
+    voice_target: VoiceTarget,
 }
 
 impl Default for App {
@@ -423,6 +432,8 @@ impl Default for App {
             show_pipeline_modal: None,
             pipeline_modal_selected: None,
             pipeline_modal_requirements: text_editor::Content::new(),
+            pipeline_modal_steps: Vec::new(),
+            voice_target: VoiceTarget::Terminal,
         }
     }
 }
@@ -1240,7 +1251,13 @@ impl App {
                         Message::VoiceResult,
                     )
                 } else {
-                    // Start recording
+                    // Start recording. Route the result to the pipeline-run
+                    // requirements editor when the run modal is open, else terminal.
+                    self.voice_target = if self.show_pipeline_modal.is_some() {
+                        VoiceTarget::PipelineRequirements
+                    } else {
+                        VoiceTarget::Terminal
+                    };
                     match self.voice_recorder.start() {
                         Ok(()) => app_log!("Voice: recording started"),
                         Err(e) => app_log!("Voice: failed to start: {}", e),
@@ -1253,12 +1270,20 @@ impl App {
                 match result {
                     Ok(text) => {
                         app_log!("Voice: transcribed: {}", text);
-                        // Write text to active terminal
-                        if let Some((pi, si)) = self.active_session {
-                            if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
-                                ti.terminal.handle(iced_term::Command::ProxyToBackend(
-                                    iced_term::backend::Command::Write(text.into_bytes())
-                                ));
+                        match self.voice_target {
+                            VoiceTarget::PipelineRequirements => {
+                                self.pipeline_modal_requirements.perform(
+                                    text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text)))
+                                );
+                            }
+                            VoiceTarget::Terminal => {
+                                if let Some((pi, si)) = self.active_session {
+                                    if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
+                                        ti.terminal.handle(iced_term::Command::ProxyToBackend(
+                                            iced_term::backend::Command::Write(text.into_bytes())
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1367,17 +1392,37 @@ impl App {
                 Task::none()
             }
             Message::KeyboardEvent(event) => {
-                if let iced::keyboard::Event::KeyPressed { key, modifiers, physical_key, .. } = event {
-                    if modifiers.command() {
-                        // Use physical key for non-latin layouts
-                        let latin = key.to_latin(physical_key);
-                        match latin {
-                            Some('o') => return self.update(Message::OpenProject),
-                            Some('n') => return self.update(Message::NewProject),
-                            Some('t') => return self.update(Message::NewSessionInCurrentFolder),
-                            _ => {}
+                use iced::keyboard::{Event as KbdEvent, Key, key::Named};
+                match event {
+                    KbdEvent::KeyPressed { key, modifiers, physical_key, .. } => {
+                        if modifiers.command() {
+                            // Use physical key for non-latin layouts
+                            let latin = key.to_latin(physical_key);
+                            match latin {
+                                Some('o') => return self.update(Message::OpenProject),
+                                Some('n') => return self.update(Message::NewProject),
+                                Some('t') => return self.update(Message::NewSessionInCurrentFolder),
+                                _ => {}
+                            }
+                        }
+                        // Alt = push-to-talk for the pipeline-run requirements field.
+                        // KeyPressed repeats while held; guard on is_recording.
+                        if matches!(key, Key::Named(Named::Alt))
+                            && self.show_pipeline_modal.is_some()
+                            && !self.voice_recorder.is_recording
+                        {
+                            return self.update(Message::VoiceToggle);
                         }
                     }
+                    KbdEvent::KeyReleased { key, .. } => {
+                        if matches!(key, Key::Named(Named::Alt))
+                            && self.voice_recorder.is_recording
+                            && self.voice_target == VoiceTarget::PipelineRequirements
+                        {
+                            return self.update(Message::VoiceToggle); // stop + transcribe
+                        }
+                    }
+                    _ => {}
                 }
                 Task::none()
             }
@@ -1568,16 +1613,30 @@ impl App {
                 self.show_pipeline_modal = Some((pi, si));
                 self.pipeline_modal_selected = if self.pipelines.is_empty() { None } else { Some(0) };
                 self.pipeline_modal_requirements = text_editor::Content::new();
+                // all steps enabled by default for the first pipeline
+                self.pipeline_modal_steps = self.pipeline_modal_selected
+                    .and_then(|i| self.pipelines.get(i))
+                    .map(|p| vec![true; p.steps.len()])
+                    .unwrap_or_default();
                 Task::none()
             }
             Message::ClosePipelineModal => {
                 self.show_pipeline_modal = None;
                 self.pipeline_modal_selected = None;
                 self.pipeline_modal_requirements = text_editor::Content::new();
+                self.pipeline_modal_steps = Vec::new();
                 Task::none()
             }
             Message::SelectPipelineForRun(idx) => {
                 self.pipeline_modal_selected = Some(idx);
+                // reset per-step selection to all-enabled for the new pipeline
+                self.pipeline_modal_steps = self.pipelines.get(idx)
+                    .map(|p| vec![true; p.steps.len()])
+                    .unwrap_or_default();
+                Task::none()
+            }
+            Message::TogglePipelineModalStep(i) => {
+                if let Some(b) = self.pipeline_modal_steps.get_mut(i) { *b = !*b; }
                 Task::none()
             }
             Message::PipelineRequirementsAction(action) => {
@@ -1589,7 +1648,14 @@ impl App {
                 let Some(p_idx) = self.pipeline_modal_selected else { return Task::none(); };
                 if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() { return Task::none(); }
                 let Some(pipeline) = self.pipelines.get(p_idx).cloned() else { return Task::none(); };
-                if pipeline.steps.is_empty() { return Task::none(); }
+                // Only the steps enabled for THIS run. The run snapshots these into
+                // PipelineRun.steps, so every downstream count (current_step,
+                // total = run.steps.len(), progress bar, next/jump) stays correct.
+                let selected_steps: Vec<PipelineStep> = pipeline.steps.iter().enumerate()
+                    .filter(|(i, _)| self.pipeline_modal_steps.get(*i).copied().unwrap_or(true))
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                if selected_steps.is_empty() { return Task::none(); }
 
                 // Save requirements file at project root.
                 let req_path = self.projects[pi].path.join(".orchpipeline");
@@ -1612,7 +1678,7 @@ impl App {
 
                 self.projects[pi].sessions[si].pipeline_run = Some(PipelineRun {
                     pipeline_name: pipeline.name.clone(),
-                    steps: pipeline.steps.clone(),
+                    steps: selected_steps,
                     current_step: 0,
                     requirements_path: req_path,
                     prepend_template: pipeline.prepend_template.clone(),
@@ -1626,6 +1692,7 @@ impl App {
                 self.show_pipeline_modal = None;
                 self.pipeline_modal_selected = None;
                 self.pipeline_modal_requirements = text_editor::Content::new();
+                self.pipeline_modal_steps = Vec::new();
                 self.save_state();
 
                 // Defer spawn slightly so the killed terminal is fully gone.
@@ -3585,9 +3652,58 @@ impl App {
             content = content.push(list);
         }
 
+        // Per-step selection for THIS run (toggle which steps will execute).
+        if let Some(p) = self.pipeline_modal_selected.and_then(|i| self.pipelines.get(i)) {
+            if !p.steps.is_empty() {
+                content = content.push(Space::new().height(4));
+                let enabled = self.pipeline_modal_steps.iter().filter(|b| **b).count();
+                content = content.push(
+                    text(format!("Steps for this run ({} / {} enabled)", enabled, p.steps.len()))
+                        .size(11).color(tc.text_muted)
+                );
+                let mut steps_list = Column::new().spacing(3);
+                for (s2, step) in p.steps.iter().enumerate() {
+                    let on = self.pipeline_modal_steps.get(s2).copied().unwrap_or(true);
+                    let check = if on { "☑" } else { "☐" };
+                    let check_color = if on { tc.green } else { tc.text_muted };
+                    let first_line: String = step.prompt.lines().find(|l| !l.trim().is_empty())
+                        .unwrap_or("").chars().take(84).collect();
+                    let preview = if first_line.trim().is_empty() { "(empty prompt)".to_string() } else { first_line };
+                    let txt_color = if on { tc.text_secondary } else { tc.text_muted };
+                    steps_list = steps_list.push(
+                        button(row![
+                            text(check).size(14).color(check_color),
+                            text(format!("{}.", s2 + 1)).size(11).color(tc.text_muted),
+                            text(preview).size(11).color(txt_color).width(Fill),
+                            if step.interactive { text("👤").size(10) } else { text("").size(1) },
+                        ].spacing(8).align_y(iced::Alignment::Center))
+                        .on_press(Message::TogglePipelineModalStep(s2))
+                        .style(button::text).padding([3, 8]).width(Fill)
+                    );
+                }
+                let cap = (p.steps.len().min(6) as f32 * 28.0).max(28.0);
+                content = content.push(scrollable(steps_list).height(cap));
+            }
+        }
+
         // Requirements (multi-line; Enter inserts a newline, click Start to submit)
         content = content.push(Space::new().height(8));
-        content = content.push(text("Requirements (saved to .orchpipeline)").size(11).color(tc.text_muted));
+        content = content.push(row![
+            text("Requirements (saved to .orchpipeline)").size(11).color(tc.text_muted),
+            Space::new().width(Fill),
+            {
+                let (icon, col) = if self.voice_recorder.is_recording {
+                    ("⏺ recording", tc.red)
+                } else if self.voice_transcribing {
+                    ("… transcribing", tc.yellow)
+                } else {
+                    ("🎙 voice", tc.text_muted)
+                };
+                button(text(icon).size(10).color(col))
+                    .on_press(Message::VoiceToggle).style(button::text).padding([2, 6])
+            },
+            text("or hold Alt").size(9).color(tc.text_muted),
+        ].spacing(8).align_y(iced::Alignment::Center));
         content = content.push(
             container(
                 text_editor(&self.pipeline_modal_requirements)
@@ -3603,11 +3719,12 @@ impl App {
                 .size(10).color(tc.text_muted)
         );
 
-        // Buttons
+        // Buttons — need a selected pipeline with at least one enabled step.
         let can_start = self.pipeline_modal_selected.is_some()
             && self.pipelines.get(self.pipeline_modal_selected.unwrap_or(0))
                 .map(|p| !p.steps.is_empty())
-                .unwrap_or(false);
+                .unwrap_or(false)
+            && self.pipeline_modal_steps.iter().any(|b| *b);
         let mut start_btn = button(text("Start").size(13).color(if can_start { tc.green } else { tc.text_muted }))
             .style(button::secondary)
             .padding([8, 20]);
@@ -3635,6 +3752,12 @@ impl App {
             iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick),
             iced::time::every(Duration::from_millis(1500)).map(|_| Message::Blink),
             iced::time::every(Duration::from_millis(100)).map(|_| Message::FrameProbe),
+            // Raw keyboard events (KeyPressed + KeyReleased) for shortcuts and the
+            // Alt push-to-talk in the pipeline-run modal.
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(k) => Some(Message::KeyboardEvent(k)),
+                _ => None,
+            }),
         ];
         // Subscribe to every terminal, not just the active one.
         //
@@ -3820,6 +3943,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::OpenRunPipelineModal(_, _) => "OpenRunPipelineModal",
         Message::ClosePipelineModal => "ClosePipelineModal",
         Message::SelectPipelineForRun(_) => "SelectPipelineForRun",
+        Message::TogglePipelineModalStep(_) => "TogglePipelineModalStep",
         Message::PipelineRequirementsAction(_) => "PipelineRequirementsAction",
         Message::StartPipeline => "StartPipeline",
         Message::PipelineSpawnNext(_, _) => "PipelineSpawnNext",

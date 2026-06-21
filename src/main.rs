@@ -1629,7 +1629,16 @@ impl App {
             Message::OpenRunPipelineModal(pi, si) => {
                 self.show_pipeline_modal = Some((pi, si));
                 self.pipeline_modal_selected = if self.pipelines.is_empty() { None } else { Some(0) };
-                self.pipeline_modal_requirements = text_editor::Content::new();
+                // Pre-fill requirements from an existing .orchpipeline so a re-run
+                // reuses the prior requirements instead of starting blank.
+                let existing_req = self.projects.get(pi)
+                    .and_then(|p| std::fs::read_to_string(p.path.join(".orchpipeline")).ok())
+                    .unwrap_or_default();
+                self.pipeline_modal_requirements = if existing_req.trim().is_empty() {
+                    text_editor::Content::new()
+                } else {
+                    text_editor::Content::with_text(&existing_req)
+                };
                 // all steps enabled by default for the first pipeline
                 self.pipeline_modal_steps = self.pipeline_modal_selected
                     .and_then(|i| self.pipelines.get(i))

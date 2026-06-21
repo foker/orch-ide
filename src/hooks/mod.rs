@@ -17,6 +17,11 @@ pub struct StatusPayload {
     /// the user something rather than finishing work.
     #[serde(rename = "lastWasQuestion", default)]
     pub last_was_question: Option<bool>,
+    /// Set by Stop hook when claude's last assistant message contains the
+    /// `ORCHIDE: DONE` marker — the explicit "this step is finished" signal the
+    /// pipeline driver gates auto-advance on.
+    #[serde(rename = "orchideDone", default)]
+    pub orchide_done: Option<bool>,
 }
 
 impl StatusPayload {
@@ -90,15 +95,16 @@ fi
 w() {{ printf '{{"status":"%s","currentTask":"%s","lastUpdate":"%s"}}' "$1" "$2" "$NOW" > "$SF"; }}
 ws() {{ printf '{{"status":"%s","lastUpdate":"%s"}}' "$1" "$NOW" > "$SF"; }}
 ws_q() {{ printf '{{"status":"%s","lastUpdate":"%s","lastWasQuestion":%s}}' "$1" "$NOW" "$2" > "$SF"; }}
+ws_qd() {{ printf '{{"status":"%s","lastUpdate":"%s","lastWasQuestion":%s,"orchideDone":%s}}' "$1" "$NOW" "$2" "$3" > "$SF"; }}
 
 case "$E" in
   PostToolUse) w "running" "Tool: ${{TN:-working}}" ;;
   Stop)
     TRANSCRIPT=""
     [ -n "$INPUT" ] && TRANSCRIPT=$(echo "$INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null || true)
-    LWQ="false"
+    LWQ="false"; DONE="false"
     if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-      LWQ=$(python3 -c "
+      RES=$(python3 -c "
 import json, re, sys
 last_text = None
 try:
@@ -125,15 +131,20 @@ try:
                 last_text = joined
 except Exception:
     pass
+is_q = False
+done = False
 if last_text:
     # Strip trailing whitespace + bracketed/parenthetical asides; check if ends with ?
     stripped = re.sub(r'[\s\)\]\*_\.]+\$', '', last_text)
-    print('true' if stripped.endswith('?') else 'false')
-else:
-    print('false')
-" 2>/dev/null || echo "false")
+    is_q = stripped.endswith('?')
+    done = 'ORCHIDE: DONE' in last_text
+print(('true' if is_q else 'false') + ' ' + ('true' if done else 'false'))
+" 2>/dev/null || echo "false false")
+      read -r LWQ DONE <<< "$RES"
+      [ -z "$LWQ" ] && LWQ="false"
+      [ -z "$DONE" ] && DONE="false"
     fi
-    ws_q "awaiting-input" "$LWQ"
+    ws_qd "awaiting-input" "$LWQ" "$DONE"
     ;;
   UserPromptSubmit) w "running" "Processing prompt..." ;;
   Notification)

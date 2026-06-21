@@ -82,6 +82,9 @@ pub struct Session {
     /// something, not finishing work.
     #[serde(skip, default)]
     pub last_was_question: bool,
+    /// True when the running step emitted the `ORCHIDE: DONE` completion marker.
+    #[serde(skip, default)]
+    pub orchide_done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -132,8 +135,14 @@ You are running step {step_n} of {total} in an automated pipeline.
 ## Open questions / next-step pointers
 - <what the next step needs to know — gotchas, scope edges, things you intentionally did not do>
 ```
-Create the directory if it does not exist (`mkdir -p {summaries_dir}`). Keep the summary terse — it is read by other claude steps, not by humans."#.to_string()
+Create the directory if it does not exist (`mkdir -p {summaries_dir}`). Keep the summary terse — it is read by other claude steps, not by humans.
+"#.to_string() + COMPLETION_MARKER_NOTE
 }
+
+/// The completion-marker instruction. The pipeline driver auto-advances a
+/// non-interactive step ONLY when claude's final message contains `ORCHIDE: DONE`.
+/// Kept separate so old pipelines can be migrated to include it.
+pub const COMPLETION_MARKER_NOTE: &str = "3. COMPLETION MARKER: ONLY when this step is genuinely finished (all the work done and the summary written), end your FINAL message with this exact line on its own:\nORCHIDE: DONE\nDo NOT emit `ORCHIDE: DONE` if any work remains, if you are asking the user a question, or if you are handing off mid-task. The pipeline auto-advances to the next step ONLY when it sees this marker — if you stop without it, the pipeline waits for you instead of skipping ahead.";
 
 impl PipelineDef {
     pub fn new(name: String) -> Self {
@@ -185,6 +194,7 @@ impl Session {
             backend_override: None,
             pipeline_run: None,
             last_was_question: false,
+            orchide_done: false,
         }
     }
 

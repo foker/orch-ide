@@ -484,6 +484,17 @@ impl App {
             app.pipelines = state.pipelines;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
+        // Migrate pre-marker pipelines: the auto-advance driver now gates on the
+        // `ORCHIDE: DONE` marker, so every step's prompt must ask for it.
+        let mut migrated = false;
+        for p in &mut app.pipelines {
+            if !p.append_template.contains("ORCHIDE: DONE") {
+                if !p.append_template.trim_end().is_empty() { p.append_template.push('\n'); }
+                p.append_template.push_str(session::COMPLETION_MARKER_NOTE);
+                migrated = true;
+            }
+        }
+        if migrated { app.save_state(); }
         app.sync_pipeline_editors();
         // Show settings if no projects yet
         if app.projects.is_empty() {
@@ -696,6 +707,8 @@ impl App {
         }
         self.projects[pi].sessions[si].status = SessionStatus::Running;
         self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
+        // Clear the completion marker so the fresh step must emit its own.
+        self.projects[pi].sessions[si].orchide_done = false;
 
         // Both modes: full claude TUI, prompt typed in after spawn. Difference is
         // only in auto-advance — non-interactive moves to next step on
@@ -1439,11 +1452,14 @@ impl App {
                                 }
                             }
                             s.last_was_question = pay.last_was_question.unwrap_or(false);
+                            s.orchide_done = pay.orchide_done.unwrap_or(false);
                         }
                         // Pipeline driver: auto-advance only for non-interactive steps.
                         // Interactive steps stop the train — the user clicks ▶ Next manually.
-                        // Also block advance when claude's last turn was a question — it's
-                        // asking the user something, not finishing work.
+                        // Advance ONLY when the step emitted the explicit `ORCHIDE: DONE`
+                        // marker (its last message). The old "first AwaitingInput edge"
+                        // heuristic skipped steps whose agent paused/handed-off mid-work
+                        // without finishing (e.g. a big "implement everything" step).
                         if let Some(run) = s.pipeline_run.as_mut() {
                             if matches!(s.status, SessionStatus::Running) {
                                 run.last_seen_running = true;
@@ -1455,6 +1471,7 @@ impl App {
                                 .map(|st| st.interactive).unwrap_or(false);
                             let done = !current_interactive
                                 && run.last_seen_running
+                                && s.orchide_done
                                 && !s.last_was_question
                                 && matches!(s.status, SessionStatus::AwaitingInput | SessionStatus::Done);
                             if done {

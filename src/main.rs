@@ -500,6 +500,18 @@ impl App {
             }
         }
         if migrated { app.save_state(); }
+        // Regenerate hook scripts for sessions with a live pipeline run, so they
+        // pick up the current hook body (e.g. the ORCHIDE: DONE marker file write)
+        // even if they were spawned by an older build.
+        for p in &app.projects {
+            for s in &p.sessions {
+                if s.pipeline_run.is_some() {
+                    if let Ok(hp) = hooks::create_hook_script(&s.id) {
+                        let _ = hooks::configure_claude_hooks(&p.path, &hp);
+                    }
+                }
+            }
+        }
         app.sync_pipeline_editors();
         // Show settings if no projects yet
         if app.projects.is_empty() {
@@ -1478,16 +1490,18 @@ impl App {
                                 }
                             }
                             s.last_was_question = pay.last_was_question.unwrap_or(false);
+                            // status.json marker (older hooks) as a fallback signal.
+                            if pay.orchide_done.unwrap_or(false) { s.orchide_done = true; }
                         }
-                        // Completion marker lives in its own file (Stop hook), robust
-                        // against Notification events rewriting status.json.
-                        s.orchide_done = hooks::read_orchide_done(&s.id);
-                        // Pipeline driver: auto-advance only for non-interactive steps.
-                        // Interactive steps stop the train — the user clicks ▶ Next manually.
-                        // Advance ONLY when the step emitted the explicit `ORCHIDE: DONE`
-                        // marker (its last message). The old "first AwaitingInput edge"
-                        // heuristic skipped steps whose agent paused/handed-off mid-work
-                        // without finishing (e.g. a big "implement everything" step).
+                        // Completion marker — read from its dedicated file (new hooks,
+                        // robust vs Notification clobbering status.json). Sticky: once
+                        // seen for the current step, stays set until the step respawns
+                        // (cleared in spawn_pipeline_step) so a later status rewrite
+                        // can't unset it before the Tick advances.
+                        if hooks::read_orchide_done(&s.id) { s.orchide_done = true; }
+                        // Pipeline driver: advance the step the moment it emits the
+                        // explicit `ORCHIDE: DONE` marker — for interactive steps too
+                        // (claude only emits it once the interaction is truly done).
                         if let Some(run) = s.pipeline_run.as_mut() {
                             if matches!(s.status, SessionStatus::Running) {
                                 run.last_seen_running = true;
@@ -1495,10 +1509,7 @@ impl App {
                             if run.prompt_pending_send && run.send_delay_ticks > 0 {
                                 run.send_delay_ticks = run.send_delay_ticks.saturating_sub(1);
                             }
-                            let current_interactive = run.steps.get(run.current_step)
-                                .map(|st| st.interactive).unwrap_or(false);
-                            let done = !current_interactive
-                                && run.last_seen_running
+                            let done = run.last_seen_running
                                 && s.orchide_done
                                 && !s.last_was_question
                                 && matches!(s.status, SessionStatus::AwaitingInput | SessionStatus::Done);

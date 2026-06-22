@@ -158,7 +158,7 @@ print(('true' if is_q else 'false') + ' ' + ('true' if done else 'false'))
     ws_qd "awaiting-input" "$LWQ" "$DONE"
     # Also record the completion marker in a dedicated file so later Notification
     # events (which rewrite status.json without it) can't clobber the signal.
-    [ "$DONE" = "true" ] && printf '1' > "${{SF%/*}}/orchide_done"
+    if [ "$DONE" = "true" ]; then printf '1' > "${{SF%/*}}/orchide_done"; fi
     ;;
   UserPromptSubmit) w "running" "Processing prompt..." ;;
   Notification)
@@ -173,6 +173,8 @@ print(('true' if is_q else 'false') + ' ' + ('true' if done else 'false'))
     ;;
   *) ;;
 esac
+# Observational hook: never fail claude with a non-zero exit.
+exit 0
 "#,
         status_file = status_file.display()
     );

@@ -709,6 +709,7 @@ impl App {
         self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
         // Clear the completion marker so the fresh step must emit its own.
         self.projects[pi].sessions[si].orchide_done = false;
+        hooks::clear_orchide_done(&sid);
 
         // Both modes: full claude TUI, prompt typed in after spawn. Difference is
         // only in auto-advance — non-interactive moves to next step on
@@ -1452,8 +1453,10 @@ impl App {
                                 }
                             }
                             s.last_was_question = pay.last_was_question.unwrap_or(false);
-                            s.orchide_done = pay.orchide_done.unwrap_or(false);
                         }
+                        // Completion marker lives in its own file (Stop hook), robust
+                        // against Notification events rewriting status.json.
+                        s.orchide_done = hooks::read_orchide_done(&s.id);
                         // Pipeline driver: auto-advance only for non-interactive steps.
                         // Interactive steps stop the train — the user clicks ▶ Next manually.
                         // Advance ONLY when the step emitted the explicit `ORCHIDE: DONE`

@@ -51,6 +51,17 @@ pub fn read_status(session_id: &str) -> Option<StatusPayload> {
 }
 
 /// Create hook script for a session
+/// True if the running step emitted the `ORCHIDE: DONE` marker (written by the
+/// Stop hook to a dedicated file so status.json rewrites can't clobber it).
+pub fn read_orchide_done(session_id: &str) -> bool {
+    status_dir().join(session_id).join("orchide_done").exists()
+}
+
+/// Clear the completion marker (called when a new pipeline step spawns).
+pub fn clear_orchide_done(session_id: &str) {
+    let _ = std::fs::remove_file(status_dir().join(session_id).join("orchide_done"));
+}
+
 /// Read the claude session id captured by the hook for this OrchIDE session,
 /// so we can resume the exact conversation via `claude --resume <id>`.
 pub fn read_claude_session_id(session_id: &str) -> Option<String> {
@@ -145,6 +156,9 @@ print(('true' if is_q else 'false') + ' ' + ('true' if done else 'false'))
       [ -z "$DONE" ] && DONE="false"
     fi
     ws_qd "awaiting-input" "$LWQ" "$DONE"
+    # Also record the completion marker in a dedicated file so later Notification
+    # events (which rewrite status.json without it) can't clobber the signal.
+    [ "$DONE" = "true" ] && printf '1' > "${{SF%/*}}/orchide_done"
     ;;
   UserPromptSubmit) w "running" "Processing prompt..." ;;
   Notification)

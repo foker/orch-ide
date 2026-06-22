@@ -296,6 +296,7 @@ enum Message {
     ClosePipelineModal,
     SelectPipelineForRun(usize),
     TogglePipelineModalStep(usize),
+    TogglePipelineModalFresh,
     PipelineRequirementsAction(text_editor::Action),
     StartPipeline,
     // Pipelines — execution
@@ -399,6 +400,9 @@ struct App {
     /// Per-step enable flags for the run modal (this run only); length tracks the
     /// selected pipeline's step count.
     pipeline_modal_steps: Vec<bool>,
+    /// "Start fresh" — wipe .orchpipeline-summaries for this run (default off so
+    /// prior summaries survive a re-run).
+    pipeline_modal_fresh: bool,
     voice_target: VoiceTarget,
 }
 
@@ -433,6 +437,7 @@ impl Default for App {
             pipeline_modal_selected: None,
             pipeline_modal_requirements: text_editor::Content::new(),
             pipeline_modal_steps: Vec::new(),
+            pipeline_modal_fresh: false,
             voice_target: VoiceTarget::Terminal,
         }
     }
@@ -948,6 +953,11 @@ impl App {
                 self.active_project = Some(pi);
                 self.file_entries = explorer::read_directory(&self.projects[pi].path, 0);
                 self.show_deployment_dropdown = false;
+                // Pages are mutually exclusive: selecting a session shows the IDE
+                // and closes settings / pipeline-run / notion.
+                self.show_settings = false;
+                self.show_pipeline_modal = None;
+                self.screen = Screen::Ide;
                 // Spawn terminal if it doesn't exist (e.g. after restart). If the
                 // session has a persisted pipeline_run, resume the current step
                 // rather than doing a plain `claude --continue` so the prompt
@@ -1646,6 +1656,10 @@ impl App {
             }
             Message::OpenRunPipelineModal(pi, si) => {
                 self.show_pipeline_modal = Some((pi, si));
+                // pipeline-run is its own page → close settings, show in IDE.
+                self.show_settings = false;
+                self.screen = Screen::Ide;
+                self.pipeline_modal_fresh = false;
                 self.pipeline_modal_selected = if self.pipelines.is_empty() { None } else { Some(0) };
                 // Pre-fill requirements from an existing .orchpipeline so a re-run
                 // reuses the prior requirements instead of starting blank.
@@ -1669,6 +1683,7 @@ impl App {
                 self.pipeline_modal_selected = None;
                 self.pipeline_modal_requirements = text_editor::Content::new();
                 self.pipeline_modal_steps = Vec::new();
+                self.pipeline_modal_fresh = false;
                 Task::none()
             }
             Message::SelectPipelineForRun(idx) => {
@@ -1681,6 +1696,10 @@ impl App {
             }
             Message::TogglePipelineModalStep(i) => {
                 if let Some(b) = self.pipeline_modal_steps.get_mut(i) { *b = !*b; }
+                Task::none()
+            }
+            Message::TogglePipelineModalFresh => {
+                self.pipeline_modal_fresh = !self.pipeline_modal_fresh;
                 Task::none()
             }
             Message::PipelineRequirementsAction(action) => {
@@ -1712,6 +1731,13 @@ impl App {
                     return Task::none();
                 }
 
+                // "Start fresh": wipe the summaries dir so this run starts clean.
+                if self.pipeline_modal_fresh {
+                    let summaries = self.projects[pi].path.join(".orchpipeline-summaries");
+                    let _ = std::fs::remove_dir_all(&summaries);
+                    app_log!("StartPipeline: fresh — cleared {}", summaries.display());
+                }
+
                 // Kill any existing terminal for this session before driving the pipeline.
                 if let Some((_, ti)) = self.terminals.iter_mut().find(|(k, _)| *k == (pi, si)) {
                     ti.terminal.handle(iced_term::Command::ProxyToBackend(
@@ -1740,6 +1766,7 @@ impl App {
                 self.pipeline_modal_selected = None;
                 self.pipeline_modal_requirements = text_editor::Content::new();
                 self.pipeline_modal_steps = Vec::new();
+                self.pipeline_modal_fresh = false;
                 self.save_state();
 
                 // Defer spawn slightly so the killed terminal is fully gone.
@@ -1853,7 +1880,11 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            Message::ToggleSettings => { self.show_settings = !self.show_settings; Task::none() }
+            Message::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                if self.show_settings { self.show_pipeline_modal = None; } // settings is its own page
+                Task::none()
+            }
             Message::SetTheme(t) => { self.current_theme = t; self.save_state(); Task::none() }
             Message::TermEvent(event) => {
                 match event {
@@ -1878,7 +1909,13 @@ impl App {
                 Task::none()
             }
             Message::SetAgentBackend(b) => { self.agent_backend = b; self.save_state(); Task::none() }
-            Message::SetScreen(s) => { self.screen = s; Task::none() }
+            Message::SetScreen(s) => {
+                // Switching IDE/Notion closes settings + pipeline-run (exclusive pages).
+                self.screen = s;
+                self.show_settings = false;
+                self.show_pipeline_modal = None;
+                Task::none()
+            }
             Message::NotionTokenChanged(t) => { self.notion_token = t; self.save_state(); Task::none() }
             Message::NotionConnect => {
                 let tok = self.notion_token.clone();
@@ -2283,7 +2320,7 @@ impl App {
                 tip(button(text("⟳").size(13).color(tc.text_muted)).on_press(Message::RefreshAll).style(button::text).padding(2), "Refresh git & PR"),
                 tip(button(text("◂").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(-40.0)).style(button::text).padding(2), "Shrink"),
                 tip(button(text("▸").size(9).color(tc.text_muted)).on_press(Message::ResizeSidebar(40.0)).style(button::text).padding(2), "Expand"),
-                tip(button(text("⚙").size(13).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(2), "Settings"),
+                tip(button(text("⚙").size(18).color(tc.text_muted)).on_press(Message::ToggleSettings).style(button::text).padding(2), "Settings"),
                 tip(button(text("⊕").size(13).color(tc.text_muted))
                         .on_press_maybe(self.active_project.filter(|pi| *pi < self.projects.len())
                             .map(|_| Message::NewSessionInCurrentFolder))
@@ -3327,8 +3364,8 @@ impl App {
                     ..Default::default()
                 });
 
-            let label = text(theme.name()).size(13).color(if is_active { tc.text_primary } else { tc.text_secondary });
-            let check = text(if is_active { "✓" } else { "" }).size(13).color(tc.green);
+            let label = text(theme.name()).size(14).color(if is_active { tc.text_primary } else { tc.text_secondary });
+            let check = text(if is_active { "✓" } else { "" }).size(14).color(tc.green);
 
             themes = themes.push(
                 button(row![swatch, label, Space::new().width(Fill), check].spacing(12).align_y(iced::Alignment::Center))
@@ -3346,7 +3383,7 @@ impl App {
                 let check_color = if self.dangerously_skip_permissions { tc.green } else { tc.text_muted };
                 button(row![
                     text(check).size(14).color(check_color),
-                    text("Launch with --dangerously-skip-permissions").size(11).color(tc.text_secondary),
+                    text("Launch with --dangerously-skip-permissions").size(12).color(tc.text_secondary),
                 ].spacing(6).align_y(iced::Alignment::Center))
                 .on_press(Message::ToggleDangerouslySkipPermissions)
                 .style(button::text).padding([4, 0])
@@ -3357,7 +3394,7 @@ impl App {
                 let check_color = if self.date_prefix_enabled { tc.green } else { tc.text_muted };
                 button(row![
                     text(check).size(14).color(check_color),
-                    text("Add date prefix to new project folders (YYYY-MM-DD-)").size(11).color(tc.text_secondary),
+                    text("Add date prefix to new project folders (YYYY-MM-DD-)").size(12).color(tc.text_secondary),
                 ].spacing(6).align_y(iced::Alignment::Center))
                 .on_press(Message::ToggleDatePrefix)
                 .style(button::text).padding([4, 0])
@@ -3366,8 +3403,8 @@ impl App {
             text("Voice Input (Groq Whisper)").size(15).color(tc.text_secondary),
             text_input("Groq API key...", &self.groq_api_key)
                 .on_input(Message::GroqKeyChanged)
-                .size(12).padding(6),
-            text("Get key at console.groq.com").size(10).color(tc.text_muted),
+                .size(13).padding(6),
+            text("Get key at console.groq.com").size(11).color(tc.text_muted),
         ].spacing(4);
 
         // Quick prompts section
@@ -3376,8 +3413,8 @@ impl App {
         for (i, prompt) in self.quick_prompts.iter().enumerate() {
             qp_section = qp_section.push(
                 row![
-                    text(prompt.clone()).size(11).color(tc.text_secondary).width(Fill),
-                    button(text("✕").size(9).color(tc.text_muted))
+                    text(prompt.clone()).size(12).color(tc.text_secondary).width(Fill),
+                    button(text("✕").size(10).color(tc.text_muted))
                         .on_press(Message::RemoveQuickPrompt(i))
                         .style(button::text).padding([2, 4]),
                 ].align_y(iced::Alignment::Center)
@@ -3388,8 +3425,8 @@ impl App {
                 text_input("New quick prompt...", &self.quick_prompt_input)
                     .on_input(Message::QuickPromptInput)
                     .on_submit(Message::AddQuickPrompt)
-                    .size(11).padding(4),
-                button(text("+").size(12).color(tc.text_muted))
+                    .size(12).padding(4),
+                button(text("+").size(13).color(tc.text_muted))
                     .on_press(Message::AddQuickPrompt)
                     .style(button::text).padding([2, 6]),
             ].spacing(4).align_y(iced::Alignment::Center)
@@ -3400,7 +3437,7 @@ impl App {
         for &b in AgentBackend::all() {
             let active = self.agent_backend == b;
             backend_row = backend_row.push(
-                button(text(b.label()).size(11)
+                button(text(b.label()).size(12)
                     .color(if active { tc.text_primary } else { tc.text_muted }))
                     .on_press(Message::SetAgentBackend(b))
                     .style(if active { button::secondary } else { button::text }).padding([4,12])
@@ -3409,8 +3446,8 @@ impl App {
         let agent_section = column![
             text("Agent Backend").size(15).color(tc.text_secondary),
             backend_row,
-            text("Only Claude Code has live status tracking (hooks). OpenCode / Codex /").size(9).color(tc.text_muted),
-            text("Xiaomi MiMo run their own TUI; MiMo = opencode pinned to mimo-v2.5-pro.").size(9).color(tc.text_muted),
+            text("Only Claude Code has live status tracking (hooks). OpenCode / Codex /").size(10).color(tc.text_muted),
+            text("Xiaomi MiMo run their own TUI; MiMo = opencode pinned to mimo-v2.5-pro.").size(10).color(tc.text_muted),
         ].spacing(6);
 
         // Notion section
@@ -3420,10 +3457,10 @@ impl App {
             text_input("Notion integration token (secret_...)", &self.notion_token)
                 .on_input(Message::NotionTokenChanged)
                 .on_submit(Message::NotionConnect)
-                .size(12).padding(6)
+                .size(13).padding(6)
         );
         notion_section = notion_section.push(
-            button(text(if self.notion_loading { "Connecting…" } else { "Connect / List databases" }).size(11).color(tc.blue))
+            button(text(if self.notion_loading { "Connecting…" } else { "Connect / List databases" }).size(12).color(tc.blue))
                 .on_press(Message::NotionConnect).style(button::text).padding([2,0])
         );
         if !self.notion_databases.is_empty() {
@@ -3432,8 +3469,8 @@ impl App {
                 let active = self.notion_database_id.as_deref() == Some(db.id.as_str());
                 dbs = dbs.push(
                     button(row![
-                        text(if active {"●"} else {"○"}).size(11).color(if active { tc.green } else { tc.text_muted }),
-                        text(db.title.clone()).size(11).color(tc.text_secondary),
+                        text(if active {"●"} else {"○"}).size(12).color(if active { tc.green } else { tc.text_muted }),
+                        text(db.title.clone()).size(12).color(tc.text_secondary),
                     ].spacing(6))
                     .on_press(Message::NotionSelectDatabase(db.id.clone()))
                     .style(button::text).padding([2,0])
@@ -3442,14 +3479,14 @@ impl App {
             notion_section = notion_section.push(dbs);
         }
         if let Some(e) = &self.notion_error {
-            notion_section = notion_section.push(text(format!("⚠ {e}")).size(10).color(tc.red));
+            notion_section = notion_section.push(text(format!("⚠ {e}")).size(11).color(tc.red));
         }
 
         // Footer
         let footer = container(
             column![
-                text("all changes saved automatically").size(10).color(tc.text_muted),
-                button(text("close").size(11).color(tc.blue))
+                text("all changes saved automatically").size(11).color(tc.text_muted),
+                button(text("close").size(12).color(tc.blue))
                     .on_press(Message::ToggleSettings)
                     .style(button::text).padding(0),
             ].spacing(2).align_x(iced::Alignment::End)
@@ -3460,7 +3497,7 @@ impl App {
         pl_section = pl_section.push(text("Pipelines").size(15).color(tc.text_secondary));
         pl_section = pl_section.push(
             text("Define ordered prompt sequences. \"Run pipeline\" on a card writes its requirements to <project>/.orchpipeline and steps run in order.")
-                .size(10).color(tc.text_muted)
+                .size(11).color(tc.text_muted)
         );
         for (idx, p) in self.pipelines.iter().enumerate() {
             let expanded = self.editing_pipeline == Some(idx);
@@ -3468,15 +3505,15 @@ impl App {
             let mut card = Column::new().spacing(6);
             card = card.push(
                 row![
-                    button(text(chevron).size(11).color(tc.text_muted))
+                    button(text(chevron).size(12).color(tc.text_muted))
                         .on_press(Message::ToggleEditPipeline(idx))
                         .style(button::text).padding([2, 6]),
                     text_input("pipeline name", &p.name)
                         .on_input(move |s| Message::PipelineNameChanged(idx, s))
-                        .size(12).padding(4),
+                        .size(13).padding(4),
                     text(format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" }))
-                        .size(10).color(tc.text_muted),
-                    button(text("✕").size(10).color(tc.text_muted))
+                        .size(11).color(tc.text_muted),
+                    button(text("✕").size(11).color(tc.text_muted))
                         .on_press(Message::RemovePipeline(idx))
                         .style(button::text).padding([2, 6]),
                 ].spacing(6).align_y(iced::Alignment::Center)
@@ -3486,19 +3523,19 @@ impl App {
                 let mut steps_col = Column::new().spacing(4)
                     .padding(Padding { top: 4.0, right: 8.0, bottom: 4.0, left: 32.0 });
                 steps_col = steps_col.push(
-                    text("Prepend to each step's prompt").size(11).color(tc.text_secondary)
+                    text("Prepend to each step's prompt").size(12).color(tc.text_secondary)
                 );
                 {
                     let cc = self.pipeline_editors.prepend.get(&idx).unwrap_or(&self.editor_fallback);
                     steps_col = steps_col.push(
                         text_editor(cc)
                             .on_action(move |a| Message::PipelinePrependAction(idx, a))
-                            .size(11).padding(6).height(ed_height(cc))
+                            .size(12).padding(6).height(ed_height(cc))
                     );
                 }
                 steps_col = steps_col.push(
                     text("{requirements} is replaced with the absolute path to <project>/.orchpipeline at run time. Leave blank to disable prepending.")
-                        .size(9).color(tc.text_muted)
+                        .size(10).color(tc.text_muted)
                 );
                 steps_col = steps_col.push(Space::new().height(8));
                 let last_idx = p.steps.len().saturating_sub(1);
@@ -3509,10 +3546,10 @@ impl App {
                     let can_down = s_idx < last_idx;
                     let up_color = if can_up { tc.text_secondary } else { Color { a: 0.3, ..tc.text_muted } };
                     let down_color = if can_down { tc.text_secondary } else { Color { a: 0.3, ..tc.text_muted } };
-                    let mut up_btn = button(text("↑").size(11).color(up_color))
+                    let mut up_btn = button(text("↑").size(12).color(up_color))
                         .style(button::text).padding([2, 4]);
                     if can_up { up_btn = up_btn.on_press(Message::MovePipelineStep(idx, s_idx, -1)); }
-                    let mut down_btn = button(text("↓").size(11).color(down_color))
+                    let mut down_btn = button(text("↓").size(12).color(down_color))
                         .style(button::text).padding([2, 4]);
                     if can_down { down_btn = down_btn.on_press(Message::MovePipelineStep(idx, s_idx, 1)); }
                     steps_col = steps_col.push(
@@ -3521,17 +3558,17 @@ impl App {
                                 tip(up_btn, "Move step up"),
                                 tip(down_btn, "Move step down"),
                             ].spacing(0),
-                            text(format!("{}.", s_idx + 1)).size(10).color(tc.text_muted),
+                            text(format!("{}.", s_idx + 1)).size(11).color(tc.text_muted),
                             {
                                 let cc = self.pipeline_editors.steps.get(&(idx, s_idx)).unwrap_or(&self.editor_fallback);
                                 text_editor(cc)
                                     .on_action(move |a| Message::PipelineStepPromptAction(idx, s_idx, a))
-                                    .size(11).padding(6).height(ed_height(cc))
+                                    .size(12).padding(6).height(ed_height(cc))
                             },
                             tip(
                                 button(row![
-                                    text(check).size(12).color(check_color),
-                                    text("interactive").size(10).color(tc.text_secondary),
+                                    text(check).size(13).color(check_color),
+                                    text("interactive").size(11).color(tc.text_secondary),
                                 ].spacing(4).align_y(iced::Alignment::Center))
                                     .on_press(Message::TogglePipelineStepInteractive(idx, s_idx))
                                     .style(button::text).padding([2, 4]),
@@ -3541,7 +3578,7 @@ impl App {
                                 button(text(match step.backend.as_deref() {
                                     None => "⚙ global".to_string(),
                                     Some(s) => AgentBackend::from_str(s).label().to_string(),
-                                }).size(9).color(tc.blue))
+                                }).size(10).color(tc.blue))
                                     .on_press(Message::CyclePipelineStepBackend(idx, s_idx))
                                     .style(button::text).padding([2, 4]),
                                 "Model for this step (click to cycle; global = settings backend)"
@@ -3559,31 +3596,31 @@ impl App {
                                     preview.push_str("\n\n"); preview.push_str(p.append_template.trim());
                                 }
                                 tip(
-                                    text("👁").size(11),
+                                    text("👁").size(12),
                                     &preview
                                 )
                             },
-                            button(text("✕").size(10).color(tc.text_muted))
+                            button(text("✕").size(11).color(tc.text_muted))
                                 .on_press(Message::RemovePipelineStep(idx, s_idx))
                                 .style(button::text).padding([2, 6]),
                         ].spacing(6).align_y(iced::Alignment::Center)
                     );
                 }
                 steps_col = steps_col.push(
-                    button(text("+ add step").size(10).color(tc.blue))
+                    button(text("+ add step").size(11).color(tc.blue))
                         .on_press(Message::AddPipelineStep(idx))
                         .style(button::text).padding([2, 4])
                 );
                 steps_col = steps_col.push(Space::new().height(8));
                 steps_col = steps_col.push(
-                    text("Append to each step's prompt").size(11).color(tc.text_secondary)
+                    text("Append to each step's prompt").size(12).color(tc.text_secondary)
                 );
                 {
                     let cc = self.pipeline_editors.append.get(&idx).unwrap_or(&self.editor_fallback);
                     steps_col = steps_col.push(
                         text_editor(cc)
                             .on_action(move |a| Message::PipelineAppendAction(idx, a))
-                            .size(11).padding(6).height(ed_height(cc))
+                            .size(12).padding(6).height(ed_height(cc))
                     );
                 }
                 card = card.push(steps_col);
@@ -3595,7 +3632,7 @@ impl App {
             );
         }
         pl_section = pl_section.push(
-            button(text("+ new pipeline").size(11).color(tc.blue))
+            button(text("+ new pipeline").size(12).color(tc.blue))
                 .on_press(Message::AddPipeline)
                 .style(button::text).padding([4, 8])
         );
@@ -3771,6 +3808,22 @@ impl App {
             text(".orchpipeline lives at <project>/.orchpipeline. Each step receives a pointer to it as the first line of its prompt.")
                 .size(10).color(tc.text_muted)
         );
+
+        // "Start fresh" toggle — wipes .orchpipeline-summaries for this run.
+        {
+            let on = self.pipeline_modal_fresh;
+            let check = if on { "☑" } else { "☐" };
+            let check_color = if on { tc.green } else { tc.text_muted };
+            content = content.push(
+                button(row![
+                    text(check).size(14).color(check_color),
+                    text("Start fresh here (re-creates .orchpipeline and clears .orchpipeline-summaries)")
+                        .size(11).color(tc.text_secondary),
+                ].spacing(6).align_y(iced::Alignment::Center))
+                .on_press(Message::TogglePipelineModalFresh)
+                .style(button::text).padding([2, 0])
+            );
+        }
 
         // Buttons — need a selected pipeline with at least one enabled step.
         let can_start = self.pipeline_modal_selected.is_some()
@@ -3997,6 +4050,7 @@ fn message_label(m: &Message) -> &'static str {
         Message::ClosePipelineModal => "ClosePipelineModal",
         Message::SelectPipelineForRun(_) => "SelectPipelineForRun",
         Message::TogglePipelineModalStep(_) => "TogglePipelineModalStep",
+        Message::TogglePipelineModalFresh => "TogglePipelineModalFresh",
         Message::PipelineRequirementsAction(_) => "PipelineRequirementsAction",
         Message::StartPipeline => "StartPipeline",
         Message::PipelineSpawnNext(_, _) => "PipelineSpawnNext",

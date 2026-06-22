@@ -3711,16 +3711,16 @@ impl App {
 
         let mut content = Column::new().spacing(14).padding(24).max_width(640);
         content = content.push(text("Run Pipeline").size(18).color(tc.text_primary));
-        content = content.push(text(format!("Session: {}", session_name)).size(11).color(tc.text_muted));
+        content = content.push(text(format!("Session: {}", session_name)).size(12).color(tc.text_muted));
 
         // Pipeline picker
         if self.pipelines.is_empty() {
             content = content.push(
                 text("No pipelines defined yet — open Settings → Pipelines to add one.")
-                    .size(12).color(tc.orange)
+                    .size(13).color(tc.orange)
             );
         } else {
-            content = content.push(text("Pipeline").size(11).color(tc.text_muted));
+            content = content.push(text("Pipeline").size(12).color(tc.text_muted));
             let mut list = Column::new().spacing(4);
             for (idx, p) in self.pipelines.iter().enumerate() {
                 let selected = self.pipeline_modal_selected == Some(idx);
@@ -3728,11 +3728,11 @@ impl App {
                 let icon_color = if selected { tc.blue } else { tc.text_muted };
                 list = list.push(
                     button(row![
-                        text(icon).size(14).color(icon_color),
-                        text(p.name.clone()).size(12).color(tc.text_primary),
+                        text(icon).size(15).color(icon_color),
+                        text(p.name.clone()).size(13).color(tc.text_primary),
                         Space::new().width(Fill),
                         text(format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" }))
-                            .size(10).color(tc.text_muted),
+                            .size(11).color(tc.text_muted),
                     ].spacing(8).align_y(iced::Alignment::Center))
                     .on_press(Message::SelectPipelineForRun(idx))
                     .style(if selected { button::secondary } else { button::text })
@@ -3749,7 +3749,7 @@ impl App {
                 let enabled = self.pipeline_modal_steps.iter().filter(|b| **b).count();
                 content = content.push(
                     text(format!("Steps for this run ({} / {} enabled)", enabled, p.steps.len()))
-                        .size(11).color(tc.text_muted)
+                        .size(12).color(tc.text_muted)
                 );
                 let mut steps_list = Column::new().spacing(3);
                 for (s2, step) in p.steps.iter().enumerate() {
@@ -3762,10 +3762,10 @@ impl App {
                     let txt_color = if on { tc.text_secondary } else { tc.text_muted };
                     steps_list = steps_list.push(
                         button(row![
-                            text(check).size(14).color(check_color),
-                            text(format!("{}.", s2 + 1)).size(11).color(tc.text_muted),
-                            text(preview).size(11).color(txt_color).width(Fill),
-                            if step.interactive { text("👤").size(10) } else { text("").size(1) },
+                            text(check).size(15).color(check_color),
+                            text(format!("{}.", s2 + 1)).size(12).color(tc.text_muted),
+                            text(preview).size(12).color(txt_color).width(Fill),
+                            if step.interactive { text("👤").size(11) } else { text("").size(1) },
                         ].spacing(8).align_y(iced::Alignment::Center))
                         .on_press(Message::TogglePipelineModalStep(s2))
                         .style(button::text).padding([3, 8]).width(Fill)
@@ -3779,7 +3779,7 @@ impl App {
         // Requirements (multi-line; Enter inserts a newline, click Start to submit)
         content = content.push(Space::new().height(8));
         content = content.push(row![
-            text("Requirements (saved to .orchpipeline)").size(11).color(tc.text_muted),
+            text("Requirements (saved to .orchpipeline)").size(12).color(tc.text_muted),
             Space::new().width(Fill),
             {
                 let (icon, col) = if self.voice_recorder.is_recording {
@@ -3789,24 +3789,24 @@ impl App {
                 } else {
                     ("🎙 voice", tc.text_muted)
                 };
-                button(text(icon).size(10).color(col))
+                button(text(icon).size(11).color(col))
                     .on_press(Message::VoiceToggle).style(button::text).padding([2, 6])
             },
-            text("or hold Alt").size(9).color(tc.text_muted),
+            text("or hold Alt").size(10).color(tc.text_muted),
         ].spacing(8).align_y(iced::Alignment::Center));
         content = content.push(
             container(
                 text_editor(&self.pipeline_modal_requirements)
                     .placeholder("Describe what the pipeline should accomplish... (Enter for newline)")
                     .on_action(Message::PipelineRequirementsAction)
-                    .size(12)
+                    .size(13)
                     .padding(8)
                     .height(220)
             )
         );
         content = content.push(
             text(".orchpipeline lives at <project>/.orchpipeline. Each step receives a pointer to it as the first line of its prompt.")
-                .size(10).color(tc.text_muted)
+                .size(11).color(tc.text_muted)
         );
 
         // "Start fresh" toggle — wipes .orchpipeline-summaries for this run.
@@ -3816,9 +3816,9 @@ impl App {
             let check_color = if on { tc.green } else { tc.text_muted };
             content = content.push(
                 button(row![
-                    text(check).size(14).color(check_color),
+                    text(check).size(15).color(check_color),
                     text("Start fresh here (re-creates .orchpipeline and clears .orchpipeline-summaries)")
-                        .size(11).color(tc.text_secondary),
+                        .size(12).color(tc.text_secondary),
                 ].spacing(6).align_y(iced::Alignment::Center))
                 .on_press(Message::TogglePipelineModalFresh)
                 .style(button::text).padding([2, 0])
@@ -3831,7 +3831,7 @@ impl App {
                 .map(|p| !p.steps.is_empty())
                 .unwrap_or(false)
             && self.pipeline_modal_steps.iter().any(|b| *b);
-        let mut start_btn = button(text("Start").size(13).color(if can_start { tc.green } else { tc.text_muted }))
+        let mut start_btn = button(text("Start").size(14).color(if can_start { tc.green } else { tc.text_muted }))
             .style(button::secondary)
             .padding([8, 20]);
         if can_start {
@@ -3839,7 +3839,7 @@ impl App {
         }
         content = content.push(
             row![
-                button(text("Cancel").size(13).color(tc.text_primary))
+                button(text("Cancel").size(14).color(tc.text_primary))
                     .on_press(Message::ClosePipelineModal)
                     .style(button::secondary)
                     .padding([8, 20]),
@@ -3848,7 +3848,10 @@ impl App {
             ]
         );
         let _ = pi; let _ = si;
-        container(content).center(Fill).height(Fill).into()
+        // Scrollable so a tall modal (many steps + requirements + checkbox) never
+        // clips the Cancel/Start buttons at the bottom.
+        container(scrollable(content).height(Fill))
+            .center_x(Fill).height(Fill).into()
     }
 
     fn theme(&self) -> Theme { Theme::Dark }

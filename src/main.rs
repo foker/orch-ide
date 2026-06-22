@@ -238,7 +238,7 @@ enum Message {
     DismissUpdate,
     TerminalExited(usize, usize), // pi, si — terminal gracefully stopped, now remove
     ProjectTerminalsExited(usize), // pi — all terminals stopped, now move to trash in async
-    ProjectDirTrashed(usize, Result<(), String>), // pi, result of trash operation
+    ProjectDirTrashed(PathBuf, Result<(), String>), // project path (stable across list changes), trash result
     ResizeSidebar(f32),
     ToggleFileExpand(usize), RefreshExplorer, RefreshAll, Tick, Blink, FrameProbe,
     KeyboardEvent(iced::keyboard::Event),
@@ -568,10 +568,11 @@ impl App {
             self.dangerously_skip_permissions,
             claude_resume_id.as_deref(),
         );
-        self.spawn_terminal_with(pi, si, program, args);
+        let claude_hooks = self.launch_agent && backend == AgentBackend::ClaudeCode;
+        self.spawn_terminal_with(pi, si, program, args, claude_hooks);
     }
 
-    fn spawn_terminal_with(&mut self, pi: usize, si: usize, program: String, args: Vec<String>) {
+    fn spawn_terminal_with(&mut self, pi: usize, si: usize, program: String, args: Vec<String>, claude_hooks: bool) {
         app_log!("spawn_terminal: pi={} si={} program={} args={:?} (active terminals: {})", pi, si, program, args, self.terminals.len());
         let cwd = self.projects[pi].path.clone();
         let tid = self.next_term_id;
@@ -609,8 +610,9 @@ impl App {
 
         if let Ok(terminal) = iced_term::Terminal::new(tid, settings) {
             app_log!("  terminal created tid={}", tid);
-            // Setup hooks — only for Claude (OpenCode does not emit them)
-            if self.agent_backend == AgentBackend::ClaudeCode && self.launch_agent {
+            // Setup hooks — only for the resolved Claude backend (OpenCode/Codex/
+            // MiMo don't emit them). Uses the per-session/step backend, not global.
+            if claude_hooks {
                 let sid = &self.projects[pi].sessions[si].id;
                 if let Ok(hp) = hooks::create_hook_script(sid) {
                     let _ = hooks::configure_claude_hooks(&self.projects[pi].path, &hp);
@@ -731,7 +733,9 @@ impl App {
             &session_name, self.dangerously_skip_permissions,
             None,
         );
-        self.spawn_terminal_with(pi, si, program, args);
+        // Pipeline status tracking (auto-advance, ORCHIDE: DONE) needs claude hooks.
+        let claude_hooks = backend == AgentBackend::ClaudeCode;
+        self.spawn_terminal_with(pi, si, program, args, claude_hooks);
         Task::perform(
             async { tokio::time::sleep(Duration::from_millis(1500)).await; },
             move |_| Message::PipelineSendPrompt(pi, si),
@@ -1095,6 +1099,7 @@ impl App {
             Message::ProjectTerminalsExited(pi) => {
                 if pi < self.projects.len() {
                     let path = self.projects[pi].path.clone();
+                    let path_for_msg = path.clone();
                     app_log!("TRASHING directory: {:?}", path);
                     // Move to Trash on a blocking worker thread — never block the UI thread.
                     return Task::perform(
@@ -1106,19 +1111,29 @@ impl App {
                             .map_err(|e| e.to_string())
                             .and_then(|r| r)
                         },
-                        move |res| Message::ProjectDirTrashed(pi, res),
+                        // Carry the PATH, not the index: the project list can change
+                        // during the await, so an index would remove the wrong project.
+                        move |res| Message::ProjectDirTrashed(path_for_msg.clone(), res),
                     );
                 }
                 Task::none()
             }
-            Message::ProjectDirTrashed(pi, res) => {
-                match &res {
-                    Ok(_) => app_log!("Trashed project dir: pi={}", pi),
-                    Err(e) => app_log!("Failed to trash: {}", e),
+            Message::ProjectDirTrashed(path, res) => {
+                match res {
+                    Ok(()) => {
+                        app_log!("Trashed project dir: {:?}", path);
+                        // Remove ONLY the project that still matches this path.
+                        if let Some(idx) = self.projects.iter().position(|p| p.path == path) {
+                            return self.update(Message::RemoveProject(idx));
+                        }
+                    }
+                    Err(e) => {
+                        // Trash failed — keep the project entry (and its sessions) so we
+                        // don't lose tracking while the directory still exists on disk.
+                        app_log!("Failed to trash {:?}: {} — keeping project in list", path, e);
+                    }
                 }
-                // Always remove project from the list even if trash failed — the user
-                // asked for it, and they can see the error via logs.
-                return self.update(Message::RemoveProject(pi));
+                Task::none()
             }
             Message::StartRenameSession(pi, si) => {
                 if pi < self.projects.len() && si < self.projects[pi].sessions.len() {
@@ -1689,8 +1704,11 @@ impl App {
                 // Save requirements file at project root.
                 let req_path = self.projects[pi].path.join(".orchpipeline");
                 let req_text = self.pipeline_modal_requirements.text();
-                if let Err(e) = std::fs::write(&req_path, &req_text) {
-                    app_log!("StartPipeline: failed to write {}: {}", req_path.display(), e);
+                // Atomic write (temp + rename) so a crash can't truncate requirements.
+                let req_tmp = self.projects[pi].path.join(".orchpipeline.tmp");
+                if std::fs::write(&req_tmp, req_text.as_bytes()).and_then(|_| std::fs::rename(&req_tmp, &req_path)).is_err() {
+                    let _ = std::fs::remove_file(&req_tmp);
+                    app_log!("StartPipeline: failed to write {}", req_path.display());
                     return Task::none();
                 }
 
@@ -2154,7 +2172,13 @@ impl App {
         let stripped: String = task.id.chars().filter(|c| *c != '-').collect();
         let short = &stripped[..stripped.len().min(8)];
         let fname = format!("TASK-{}.md", short);
-        let _ = std::fs::write(self.projects[pi].path.join(&fname), md);
+        // Don't clobber a TASK-*.md the user may have edited: write only if it
+        // doesn't exist yet (create_new). If it's already there, keep it.
+        let task_path = self.projects[pi].path.join(&fname);
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&task_path) {
+            use std::io::Write;
+            let _ = f.write_all(md.as_bytes());
+        }
         let name = name_override.unwrap_or_else(|| {
             if task.title.trim().is_empty() { fname.clone() } else { task.title.clone() }
         });

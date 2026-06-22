@@ -200,27 +200,34 @@ pub fn configure_claude_hooks(project_path: &Path, hook_script: &Path) -> Result
     let settings_file = claude_dir.join("settings.local.json");
     let mut settings: serde_json::Value = if settings_file.exists() {
         let content = std::fs::read_to_string(&settings_file)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                // Existing file is unparseable or not a JSON object. Do NOT
+                // overwrite it with `{}` — that would destroy the user's Claude
+                // settings. Back it up and skip hook installation (status tracking
+                // degrades, but the user's file is preserved).
+                let bak = settings_file.with_extension("local.json.orchide-bak");
+                let _ = std::fs::copy(&settings_file, &bak);
+                return Ok(());
+            }
+        }
     } else {
         serde_json::json!({})
     };
 
     let hook_command = format!("bash \"{}\"", hook_script.display());
 
-    let hooks = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert(serde_json::json!({}))
-        .as_object_mut()
-        .unwrap();
+    // settings is guaranteed an object here.
+    let root = settings.as_object_mut().expect("settings is an object");
+    let hooks_val = root.entry("hooks").or_insert(serde_json::json!({}));
+    if !hooks_val.is_object() { *hooks_val = serde_json::json!({}); }
+    let hooks = hooks_val.as_object_mut().expect("hooks coerced to object");
 
     for event in &["PostToolUse", "Stop", "Notification", "UserPromptSubmit"] {
-        let arr = hooks
-            .entry(*event)
-            .or_insert(serde_json::json!([]))
-            .as_array_mut()
-            .unwrap();
+        let arr_val = hooks.entry(*event).or_insert(serde_json::json!([]));
+        if !arr_val.is_array() { *arr_val = serde_json::json!([]); }
+        let arr = arr_val.as_array_mut().expect("event coerced to array");
 
         // Remove any old claude-agents hooks, then add current one
         arr.retain(|entry| {
@@ -242,6 +249,10 @@ pub fn configure_claude_hooks(project_path: &Path, hook_script: &Path) -> Result
         }));
     }
 
-    std::fs::write(&settings_file, serde_json::to_string_pretty(&settings)?)?;
+    // Atomic write so a crash mid-write can't truncate the user's settings file.
+    let json = serde_json::to_string_pretty(&settings)?;
+    let tmp = settings_file.with_extension("local.json.tmp");
+    std::fs::write(&tmp, json.as_bytes())?;
+    std::fs::rename(&tmp, &settings_file)?;
     Ok(())
 }

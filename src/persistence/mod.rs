@@ -54,15 +54,39 @@ fn config_path() -> PathBuf {
 
 pub fn save(state: &AppState) {
     let path = config_path();
-    if let Ok(json) = serde_json::to_string_pretty(state) {
-        std::fs::write(&path, json).ok();
+    let Ok(json) = serde_json::to_string_pretty(state) else { return; };
+    // Atomic write: serialize to a temp file in the SAME directory, then rename
+    // over the real config. A crash/kill mid-write can't truncate or corrupt
+    // config.json (which holds ALL projects/sessions/pipelines/task links) —
+    // either the old file or the fully-written new one is present, never a
+    // half-written one. Direct `fs::write` would leave a truncated file on kill.
+    // Unique temp name (pid) so two app instances can't clobber each other's
+    // temp file mid-write before the rename.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 pub fn load() -> Option<AppState> {
     let path = config_path();
     let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    match serde_json::from_str(&content) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            // The config exists but didn't parse. Do NOT silently start empty and
+            // then overwrite it — preserve the file so the user can recover, and
+            // log why.
+            let backup = path.with_extension(format!("corrupt-{}.json", std::process::id()));
+            let _ = std::fs::copy(&path, &backup);
+            crate::app_log!("persistence: config parse failed ({}); backed up to {}", e, backup.display());
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -500,14 +500,17 @@ impl App {
             }
         }
         if migrated { app.save_state(); }
-        // Regenerate hook scripts for sessions with a live pipeline run, so they
-        // pick up the current hook body (e.g. the ORCHIDE: DONE marker file write)
-        // even if they were spawned by an older build.
-        for p in &app.projects {
-            for s in &p.sessions {
-                if s.pipeline_run.is_some() {
+        // For live pipeline runs: regenerate hooks (pick up the current marker
+        // body) and stamp step_spawn_at = now so only summaries written AFTER this
+        // launch count as completion (avoids cascading on stale prior-run summaries).
+        let boot_now = chrono::Utc::now().timestamp();
+        for p in &mut app.projects {
+            let path = p.path.clone();
+            for s in &mut p.sessions {
+                if let Some(run) = s.pipeline_run.as_mut() {
+                    run.step_spawn_at = boot_now;
                     if let Ok(hp) = hooks::create_hook_script(&s.id) {
-                        let _ = hooks::configure_claude_hooks(&p.path, &hp);
+                        let _ = hooks::configure_claude_hooks(&path, &hp);
                     }
                 }
             }
@@ -726,9 +729,13 @@ impl App {
         }
         self.projects[pi].sessions[si].status = SessionStatus::Running;
         self.projects[pi].sessions[si].status_changed_at = chrono::Utc::now();
-        // Clear the completion marker so the fresh step must emit its own.
+        // Clear the completion marker so the fresh step must emit its own, and
+        // stamp the spawn time so only a NEWER summary counts as "this step done".
         self.projects[pi].sessions[si].orchide_done = false;
         hooks::clear_orchide_done(&sid);
+        if let Some(run) = self.projects[pi].sessions[si].pipeline_run.as_mut() {
+            run.step_spawn_at = chrono::Utc::now().timestamp();
+        }
 
         // Both modes: full claude TUI, prompt typed in after spawn. Difference is
         // only in auto-advance — non-interactive moves to next step on
@@ -1509,8 +1516,19 @@ impl App {
                             if run.prompt_pending_send && run.send_delay_ticks > 0 {
                                 run.send_delay_ticks = run.send_delay_ticks.saturating_sub(1);
                             }
-                            let done = run.last_seen_running
-                                && s.orchide_done
+                            // Robust completion: the explicit marker (sticky), OR the
+                            // current step's summary file written AFTER the step spawned
+                            // (survives restart + a missed/cleared marker file).
+                            let summary_done = {
+                                let f = p.path.join(".orchpipeline-summaries")
+                                    .join(format!("step-{}.md", run.current_step + 1));
+                                std::fs::metadata(&f).ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs() as i64 >= run.step_spawn_at)
+                                    .unwrap_or(false)
+                            };
+                            let done = (s.orchide_done || summary_done)
                                 && !s.last_was_question
                                 && matches!(s.status, SessionStatus::AwaitingInput | SessionStatus::Done);
                             if done {
@@ -1767,6 +1785,7 @@ impl App {
                     requirements_path: req_path,
                     prepend_template: pipeline.prepend_template.clone(),
                     append_template: pipeline.append_template.clone(),
+                    step_spawn_at: chrono::Utc::now().timestamp(),
                     last_seen_running: false,
                     prompt_pending_send: false,
                     send_delay_ticks: 0,

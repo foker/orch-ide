@@ -171,6 +171,11 @@ pub struct PipelineRun {
     pub prepend_template: String,
     #[serde(default = "default_append_template")]
     pub append_template: String,
+    /// Unix seconds when the current step was (re)spawned. A summary file for the
+    /// current step that is newer than this means the step finished — a robust
+    /// completion signal that survives restarts and a missed marker file.
+    #[serde(default)]
+    pub step_spawn_at: i64,
     #[serde(skip, default)]
     pub last_seen_running: bool,
     #[serde(skip, default)]

@@ -71,6 +71,9 @@ pub struct Session {
     pub status_changed_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub color: SessionColor,
+    /// Pinned sessions float to a dedicated zone at the top of the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
     /// Per-session agent backend override (AgentBackend::as_str). None = use the
     /// global backend from settings.
     #[serde(default)]
@@ -176,6 +179,12 @@ pub struct PipelineRun {
     /// completion signal that survives restarts and a missed marker file.
     #[serde(default)]
     pub step_spawn_at: i64,
+    /// Per-step agent session id (claude conversation id, captured by the Stop
+    /// hook) so re-opening a step resumes its conversation instead of starting
+    /// fresh. Parallel to `steps`; `None` = never captured / start fresh. Cleared
+    /// when the run starts with "Start fresh".
+    #[serde(default)]
+    pub step_sessions: Vec<Option<String>>,
     #[serde(skip, default)]
     pub last_seen_running: bool,
     #[serde(skip, default)]
@@ -196,6 +205,7 @@ impl Session {
             created_at: now,
             status_changed_at: now,
             color: SessionColor::Grey,
+            pinned: false,
             backend_override: None,
             pipeline_run: None,
             last_was_question: false,

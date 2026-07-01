@@ -11,6 +11,14 @@ pub struct TaskLink {
     pub session_name: String,
 }
 
+/// Tracks how often / how recently a folder was opened as a project, for the
+/// "Popular" and "Recent" lists in the open-project modal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderOpenStat {
+    pub count: u32,
+    pub last_opened: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub projects: Vec<ProjectGroup>,
@@ -38,6 +46,9 @@ pub struct AppState {
     pub task_links: HashMap<String, Vec<TaskLink>>,
     #[serde(default)]
     pub pipelines: Vec<PipelineDef>,
+    /// folder path (as string) -> how often / how recently it was opened.
+    #[serde(default)]
+    pub folder_opens: HashMap<String, FolderOpenStat>,
 }
 
 fn default_sidebar_width() -> f32 { 280.0 }
@@ -115,6 +126,7 @@ mod tests {
             agent_backend: "OpenCode".into(),
             task_links: HashMap::new(),
             pipelines: vec![],
+            folder_opens: HashMap::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: AppState = serde_json::from_str(&json).unwrap();

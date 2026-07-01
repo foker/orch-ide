@@ -7,10 +7,11 @@ mod hooks;
 mod persistence;
 mod logging;
 mod voice;
+mod ui_widgets;
 
 use iced::widget::{
     button, column, container, row, scrollable, text,
-    text_editor, text_input, mouse_area, Column, Row, Space, rule,
+    text_editor, text_input, mouse_area, Column, Row, Space, rule, stack,
 };
 use iced::{Element, Fill, Font, Padding, Subscription, Theme, Color, Border, Background, Task};
 use session::{PipelineDef, PipelineRun, PipelineStep, ProjectGroup, Session, SessionStatus};
@@ -20,7 +21,7 @@ use std::time::Duration;
 
 const MONO_FONT: Font = Font::with_name("JetBrains Mono");
 const SESSION_INPUT_ID: &str = "session-name-input";
-const APP_VERSION: &str = "0.2.1";
+const APP_VERSION: &str = "0.3.0";
 
 fn main() -> iced::Result {
     logging::init();
@@ -212,6 +213,9 @@ enum Message {
     ToggleLaunchClaude,
     SelectSession(usize, usize), KillSession(usize, usize), MakeIdle(usize, usize),
     CardHover(Option<(usize, usize)>),
+    TogglePinSession(usize, usize),
+    ToggleCardMenu(usize, usize), CloseCardMenu,
+    ShowOpenModal, CloseOpenModal, OpenRecentFolder(PathBuf),
     StartRenameSession(usize, usize), RenameSessionInput(String), RenameSessionSubmit,
     SetSessionColor(usize, usize, session::SessionColor),
     SetNewSessionColor(session::SessionColor),
@@ -278,6 +282,10 @@ enum Message {
     // Pipelines — settings editor
     AddPipeline,
     RemovePipeline(usize),
+    StartDuplicatePipeline(usize),
+    DuplicateNameInput(String),
+    DuplicatePipelineSubmit,
+    CancelDuplicatePipeline,
     PipelineNameChanged(usize, String),
     PipelinePrependChanged(usize, String),
     PipelineAppendChanged(usize, String),
@@ -393,6 +401,9 @@ struct App {
     // Pipelines
     pipelines: Vec<PipelineDef>,
     editing_pipeline: Option<usize>,
+    // Duplicate-pipeline flow: source pipeline index + the required new name.
+    duplicating_pipeline: Option<usize>,
+    duplicate_name_input: String,
     // Active "Run pipeline" modal targeting (pi, si).
     show_pipeline_modal: Option<(usize, usize)>,
     pipeline_modal_selected: Option<usize>,
@@ -404,6 +415,12 @@ struct App {
     /// prior summaries survive a re-run).
     pipeline_modal_fresh: bool,
     voice_target: VoiceTarget,
+    /// Which session card currently has its "⋯" floating menu open.
+    card_menu_open: Option<(usize, usize)>,
+    /// The "+" modal (Create new / Open existing + popular/recent folders).
+    show_open_modal: bool,
+    /// folder path -> open count / last-opened, for the popular/recent lists.
+    folder_opens: std::collections::HashMap<String, persistence::FolderOpenStat>,
 }
 
 impl Default for App {
@@ -433,12 +450,17 @@ impl Default for App {
             last_frame_probe: None,
             pipelines: Vec::new(),
             editing_pipeline: None,
+            duplicating_pipeline: None,
+            duplicate_name_input: String::new(),
             show_pipeline_modal: None,
             pipeline_modal_selected: None,
             pipeline_modal_requirements: text_editor::Content::new(),
             pipeline_modal_steps: Vec::new(),
             pipeline_modal_fresh: false,
             voice_target: VoiceTarget::Terminal,
+            card_menu_open: None,
+            show_open_modal: false,
+            folder_opens: std::collections::HashMap::new(),
         }
     }
 }
@@ -487,6 +509,7 @@ impl App {
             app.agent_backend = AgentBackend::from_str(&state.agent_backend);
             app.task_links = state.task_links;
             app.pipelines = state.pipelines;
+            app.folder_opens = state.folder_opens;
             // Git info loaded lazily on SelectSession (no blocking boot)
         }
         // Migrate pre-marker pipelines: the auto-advance driver now gates on the
@@ -708,6 +731,10 @@ impl App {
         let Some(step) = run.steps.get(run.current_step).cloned() else {
             return Task::none();
         };
+        // Re-open of a step: if we captured its agent session id on a prior run,
+        // resume that conversation instead of starting a fresh one.
+        let resume_id = run.step_sessions.get(run.current_step).cloned().flatten()
+            .filter(|s| !s.is_empty());
         let req_path = run.requirements_path.clone();
         let prepend = run.prepend_template.clone();
         let append = run.append_template.clone();
@@ -751,11 +778,14 @@ impl App {
         // Per-step backend (claude / opencode / codex / mimo), else global.
         let backend = step.backend.as_deref().map(AgentBackend::from_str).unwrap_or(self.agent_backend);
         let session_name = self.projects[pi].sessions[si].name.clone();
+        // Resume only has an effect for Claude (the only backend build_agent_command
+        // can reopen by id). Other backends ignore it and start fresh.
+        let resume = resume_id.is_some();
         let (program, args) = build_agent_command(
-            backend, true, false,
+            backend, true, resume,
             &which_claude(), &which_opencode(), &which_codex(),
             &session_name, self.dangerously_skip_permissions,
-            None,
+            resume_id.as_deref(),
         );
         // Pipeline status tracking (auto-advance, ORCHIDE: DONE) needs claude hooks.
         let claude_hooks = backend == AgentBackend::ClaudeCode;
@@ -818,19 +848,61 @@ impl App {
             agent_backend: self.agent_backend.as_str().to_string(),
             task_links: self.task_links.clone(),
             pipelines: self.pipelines.clone(),
+            folder_opens: self.folder_opens.clone(),
         });
+    }
+
+    /// Record that `path` was opened as a project (bumps count + last_opened),
+    /// powering the Popular / Recent lists in the open-project modal.
+    fn record_folder_open(&mut self, path: &std::path::Path) {
+        let key = path.to_string_lossy().to_string();
+        let now = chrono::Utc::now();
+        let stat = self.folder_opens.entry(key).or_insert(persistence::FolderOpenStat {
+            count: 0,
+            last_opened: now,
+        });
+        stat.count = stat.count.saturating_add(1);
+        stat.last_opened = now;
+    }
+
+    /// Top folders by open count (most popular first), excluding folders already
+    /// open as projects. Returns (path, count).
+    fn popular_folders(&self, limit: usize) -> Vec<(PathBuf, u32)> {
+        let open: std::collections::HashSet<String> =
+            self.projects.iter().map(|p| p.path.to_string_lossy().to_string()).collect();
+        let mut v: Vec<(PathBuf, u32)> = self.folder_opens.iter()
+            .filter(|(k, _)| !open.contains(*k))
+            .map(|(k, s)| (PathBuf::from(k), s.count))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(limit);
+        v
+    }
+
+    /// Most recently opened folders, excluding folders already open as projects.
+    fn recent_folders(&self, limit: usize) -> Vec<PathBuf> {
+        let open: std::collections::HashSet<String> =
+            self.projects.iter().map(|p| p.path.to_string_lossy().to_string()).collect();
+        let mut v: Vec<(PathBuf, chrono::DateTime<chrono::Utc>)> = self.folder_opens.iter()
+            .filter(|(k, _)| !open.contains(*k))
+            .map(|(k, s)| (PathBuf::from(k), s.last_opened))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.into_iter().take(limit).map(|(p, _)| p).collect()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let _guard = logging::perf(message_label(&message));
         match message {
             Message::OpenProject => {
+                self.show_open_modal = false;
                 Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Open existing project folder")
                         .pick_folder().await.map(|h| h.path().to_path_buf())
                 }, Message::ProjectPicked)
             }
             Message::NewProject => {
+                self.show_open_modal = false;
                 Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Select PARENT folder for new project")
                         .pick_folder().await.map(|h| h.path().to_path_buf())
@@ -838,8 +910,10 @@ impl App {
             }
             Message::ProjectPicked(path) => {
                 app_log!("ProjectPicked: {:?}", path);
+                self.show_open_modal = false;
                 if let Some(p) = path {
                     if p.is_dir() {
+                        self.record_folder_open(&p);
                         let name = p.file_name().map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| p.display().to_string());
                         let mut group = ProjectGroup::new(name.clone(), p.clone());
@@ -926,6 +1000,7 @@ impl App {
                             if let Err(e) = std::fs::create_dir_all(&new_path) {
                                 app_log!("Failed to create folder: {}", e);
                             } else {
+                                self.record_folder_open(&new_path);
                                 let mut group = ProjectGroup::new(folder_name.clone(), new_path.clone());
                                 if let Some(info) = git_info::get_git_info_with_pr(&new_path) {
                                     group.branch = info.branch.clone(); group.dirty_files = info.dirty_files;
@@ -935,6 +1010,9 @@ impl App {
                                 let new_pi = self.projects.len() - 1;
                                 let mut session = Session::new(name);
                                 session.color = self.new_session_color;
+                                // Pin the model the session was created with so it
+                                // never drifts if the global default changes later.
+                                session.backend_override = Some(self.agent_backend.as_str().to_string());
                                 self.projects[new_pi].sessions.push(session);
                                 self.active_project = Some(new_pi);
                                 self.active_session = Some((new_pi, 0));
@@ -947,6 +1025,9 @@ impl App {
                         // Normal "add session" flow
                         let mut session = Session::new(name);
                         session.color = self.new_session_color;
+                        // Pin the model the session was created with so it never
+                        // drifts if the global default changes later.
+                        session.backend_override = Some(self.agent_backend.as_str().to_string());
                         self.projects[pi].sessions.push(session);
                         let si = self.projects[pi].sessions.len() - 1;
                         self.active_session = Some((pi, si));
@@ -960,6 +1041,31 @@ impl App {
                 Task::none()
             }
             Message::CardHover(v) => { self.hovered_card = v; Task::none() }
+            Message::TogglePinSession(pi, si) => {
+                if let Some(s) = self.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(si)) {
+                    s.pinned = !s.pinned;
+                    self.save_state();
+                }
+                self.card_menu_open = None;
+                Task::none()
+            }
+            Message::ToggleCardMenu(pi, si) => {
+                self.card_menu_open = if self.card_menu_open == Some((pi, si)) {
+                    None
+                } else {
+                    Some((pi, si))
+                };
+                Task::none()
+            }
+            Message::CloseCardMenu => { self.card_menu_open = None; Task::none() }
+            Message::ShowOpenModal => { self.show_open_modal = true; Task::none() }
+            Message::CloseOpenModal => { self.show_open_modal = false; Task::none() }
+            Message::OpenRecentFolder(path) => {
+                self.show_open_modal = false;
+                // Reuse the existing open-folder path: it records the open, adds
+                // the project and pops the session-name dialog.
+                return self.update(Message::ProjectPicked(Some(path)));
+            }
             Message::SelectSession(pi, si) => {
                 app_log!("SelectSession: pi={} si={}", pi, si);
                 if pi >= self.projects.len() || si >= self.projects[pi].sessions.len() {
@@ -1510,6 +1616,21 @@ impl App {
                         // explicit `ORCHIDE: DONE` marker — for interactive steps too
                         // (claude only emits it once the interaction is truly done).
                         if let Some(run) = s.pipeline_run.as_mut() {
+                            // Capture the current step's agent (claude) session id
+                            // as soon as the hook records it, so re-opening this
+                            // step later resumes the same conversation.
+                            if let Some(csid) = hooks::read_claude_session_id(&s.id) {
+                                if !csid.is_empty() {
+                                    if run.step_sessions.len() < run.steps.len() {
+                                        run.step_sessions.resize(run.steps.len(), None);
+                                    }
+                                    if let Some(slot) = run.step_sessions.get_mut(run.current_step) {
+                                        if slot.as_deref() != Some(csid.as_str()) {
+                                            *slot = Some(csid);
+                                        }
+                                    }
+                                }
+                            }
                             if matches!(s.status, SessionStatus::Running) {
                                 run.last_seen_running = true;
                             }
@@ -1563,6 +1684,39 @@ impl App {
                     self.save_state();
                 }
                 self.sync_pipeline_editors();
+                Task::none()
+            }
+            Message::StartDuplicatePipeline(idx) => {
+                if idx < self.pipelines.len() {
+                    self.duplicating_pipeline = Some(idx);
+                    // Require a name — prefill with a sensible suggestion to edit.
+                    self.duplicate_name_input = format!("{} copy", self.pipelines[idx].name);
+                }
+                iced::widget::operation::focus_next()
+            }
+            Message::DuplicateNameInput(s) => { self.duplicate_name_input = s; Task::none() }
+            Message::CancelDuplicatePipeline => {
+                self.duplicating_pipeline = None;
+                self.duplicate_name_input.clear();
+                Task::none()
+            }
+            Message::DuplicatePipelineSubmit => {
+                let name = self.duplicate_name_input.trim().to_string();
+                if let (Some(idx), false) = (self.duplicating_pipeline, name.is_empty()) {
+                    if idx < self.pipelines.len() {
+                        // Full deep copy (steps/prepend/append), new id + the given name.
+                        let mut dup = self.pipelines[idx].clone();
+                        dup.id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+                        dup.name = name;
+                        let insert_at = idx + 1;
+                        self.pipelines.insert(insert_at, dup);
+                        self.editing_pipeline = Some(insert_at);
+                        self.save_state();
+                        self.sync_pipeline_editors();
+                    }
+                }
+                self.duplicating_pipeline = None;
+                self.duplicate_name_input.clear();
                 Task::none()
             }
             Message::PipelineNameChanged(idx, name) => {
@@ -1778,6 +1932,21 @@ impl App {
                 }
                 self.terminals.retain(|(k, _)| *k != (pi, si));
 
+                // Carry captured agent sessions from a prior run of the SAME
+                // pipeline so a non-fresh re-run resumes each step's conversation.
+                // "Start fresh" drops them (and the summaries) — nothing counts.
+                let n_steps = selected_steps.len();
+                let step_sessions = if self.pipeline_modal_fresh {
+                    vec![None; n_steps]
+                } else {
+                    match self.projects[pi].sessions[si].pipeline_run.as_ref() {
+                        Some(prev) if prev.pipeline_name == pipeline.name
+                            && prev.step_sessions.len() == n_steps =>
+                            prev.step_sessions.clone(),
+                        _ => vec![None; n_steps],
+                    }
+                };
+
                 self.projects[pi].sessions[si].pipeline_run = Some(PipelineRun {
                     pipeline_name: pipeline.name.clone(),
                     steps: selected_steps,
@@ -1786,6 +1955,7 @@ impl App {
                     prepend_template: pipeline.prepend_template.clone(),
                     append_template: pipeline.append_template.clone(),
                     step_spawn_at: chrono::Utc::now().timestamp(),
+                    step_sessions,
                     last_seen_running: false,
                     prompt_pending_send: false,
                     send_delay_ticks: 0,
@@ -2257,10 +2427,10 @@ impl App {
         }
         self.projects[pi].sessions.push(Session::new(name));
         let si = self.projects[pi].sessions.len() - 1;
-        // apply the backend picked in the task detail (None if it equals global)
-        if self.new_session_backend != self.agent_backend {
-            self.projects[pi].sessions[si].backend_override = Some(self.new_session_backend.as_str().to_string());
-        }
+        // Pin the model picked in the task detail. Always stored (even when it
+        // equals the global default) so it never drifts on later global changes.
+        self.projects[pi].sessions[si].backend_override =
+            Some(self.new_session_backend.as_str().to_string());
         self.active_project = Some(pi);
         self.active_session = Some((pi, si));
         self.spawn_session_terminal(pi, si, false);
@@ -2337,7 +2507,354 @@ impl App {
             ].padding(4).spacing(12),
         ).style(move |_: &Theme| styled_panel(&tc4));
 
-        column![main, status].into()
+        let base = column![main, status];
+        if self.show_open_modal {
+            stack![base, self.view_open_modal()].into()
+        } else {
+            base.into()
+        }
+    }
+
+    /// The "New / open project" modal: two big actions plus the most popular and
+    /// most recently opened folders. Rendered as a global centered overlay.
+    fn view_open_modal(&self) -> Element<'_, Message> {
+        let tc = self.tc();
+
+        let big_btn = |icon: &str, label: &str, sub: &str, msg: Message, accent: Color| -> Element<'_, Message> {
+            button(
+                column![
+                    text(icon.to_string()).size(30).color(accent),
+                    text(label.to_string()).size(15).color(tc.text_primary),
+                    text(sub.to_string()).size(10).color(tc.text_muted),
+                ].spacing(6).align_x(iced::Alignment::Center)
+            )
+            .on_press(msg)
+            .style(button::secondary)
+            .padding([24, 20])
+            .width(Fill)
+            .into()
+        };
+
+        let actions = row![
+            big_btn("\u{2795}", "Create new", "Make a new project folder", Message::NewProject, tc.green),
+            big_btn("\u{1F4C2}", "Open existing", "Pick an existing folder", Message::OpenProject, tc.blue),
+        ].spacing(12);
+
+        // A clickable folder row used by both Popular and Recent.
+        let folder_row = |path: &std::path::Path, badge: Option<String>| -> Element<'_, Message> {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let full = path.display().to_string();
+            let mut r = Row::new().spacing(8).align_y(iced::Alignment::Center);
+            r = r.push(text("\u{1F4C1}").size(13));
+            r = r.push(column![
+                text(name).size(12).color(tc.text_primary),
+                text(full).size(9).font(MONO_FONT).color(tc.text_muted),
+            ].spacing(1).width(Fill));
+            if let Some(b) = badge {
+                r = r.push(text(b).size(10).color(tc.text_muted));
+            }
+            button(r)
+                .on_press(Message::OpenRecentFolder(path.to_path_buf()))
+                .style(button::text)
+                .padding([5, 8])
+                .width(Fill)
+                .into()
+        };
+
+        let popular = self.popular_folders(10);
+        let recent = self.recent_folders(10);
+
+        let mut body = Column::new().spacing(10);
+        body = body.push(
+            row![
+                text("New / open project").size(16).color(tc.text_primary),
+                Space::new().width(Fill),
+                tip(button(text("\u{2715}").size(14).color(tc.text_muted))
+                        .on_press(Message::CloseOpenModal).style(button::text).padding([2, 6]),
+                    "Close"),
+            ].align_y(iced::Alignment::Center)
+        );
+        body = body.push(actions);
+
+        if !popular.is_empty() {
+            let mut col = Column::new().spacing(2)
+                .push(text("\u{2605} POPULAR").size(10).color(tc.text_muted));
+            for (p, count) in &popular {
+                col = col.push(folder_row(p, Some(format!("\u{2605} {}", count))));
+            }
+            body = body.push(container(col).padding([6, 0]));
+        }
+        if !recent.is_empty() {
+            let mut col = Column::new().spacing(2)
+                .push(text("\u{1F551} RECENT").size(10).color(tc.text_muted));
+            for p in &recent {
+                col = col.push(folder_row(p, None));
+            }
+            body = body.push(container(col).padding([6, 0]));
+        }
+
+        let card = container(scrollable(body).height(iced::Length::Shrink))
+            .width(440)
+            .max_height(560)
+            .padding(18)
+            .style({ let t = tc.clone(); move |_: &Theme| container::Style {
+                background: Some(Background::Color(t.bg_card)),
+                border: Border { color: Color { a: 0.4, ..t.text_muted }, width: 1.0, radius: 10.0.into(), ..Default::default() },
+                ..Default::default()
+            }});
+
+        // Dimmed backdrop dismisses on click; the card absorbs its own clicks
+        // (ShowOpenModal is idempotent, so it just keeps the modal open).
+        let backdrop = mouse_area(
+            container(Space::new().width(Fill).height(Fill))
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(Color { a: 0.55, ..Color::BLACK })),
+                    ..Default::default()
+                })
+        ).on_press(Message::CloseOpenModal);
+
+        let centered = container(mouse_area(card).on_press(Message::ShowOpenModal))
+            .center(Fill);
+
+        stack![backdrop, centered].into()
+    }
+
+    /// Build a single session card. Shared between the pinned zone (top of the
+    /// sidebar) and the normal per-project listing.
+    fn session_card(&self, pi: usize, si: usize) -> Element<'_, Message> {
+        let tc = self.tc();
+        let project = &self.projects[pi];
+        let session = &project.sessions[si];
+        let is_active = self.active_session == Some((pi, si));
+        let sc = tc.status_color(&session.status);
+        let t = tc.clone();
+
+        // Top row: dot + name + agents + status
+        let mut top = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        let dot_color = if session.status == SessionStatus::AwaitingInput && !self.blink_on {
+            Color { a: 0.3, ..sc }
+        } else {
+            sc
+        };
+        if session.pinned {
+            top = top.push(tip(text("\u{1F4CC}").size(10), "Pinned"));
+        }
+        if session.pipeline_run.is_some() {
+            top = top.push(text("⚙").size(12).color(dot_color));
+        } else {
+            top = top.push(text("●").size(8).color(dot_color));
+        }
+        if self.renaming_session == Some((pi, si)) {
+            top = top.push(
+                text_input("name", &self.rename_input)
+                    .on_input(Message::RenameSessionInput)
+                    .on_submit(Message::RenameSessionSubmit)
+                    .size(13).padding(2).width(Fill)
+            );
+        } else {
+            top = top.push(text(&session.name).size(13).color(tc.text_primary));
+            if self.hovered_card == Some((pi, si)) || is_active {
+                top = top.push(
+                    tip(
+                        button(text("✎").size(12).color(Color { a: 0.5, ..tc.text_primary }))
+                            .on_press(Message::StartRenameSession(pi, si))
+                            .style(button::text).padding([0, 3]),
+                        "Change title and color"
+                    )
+                );
+            }
+        }
+        if session.background_agents > 0 {
+            top = top.push(text(format!("🤖{}", session.background_agents)).size(10).color(tc.green));
+        }
+        top = top.push(Space::new().width(Fill));
+
+        // Meta: show sub-repos with branches, or single branch
+        let meta: Element<'_, Message> = if project.sub_repos.len() > 1 {
+            let mut col = Column::new().spacing(2);
+            for sr in &project.sub_repos {
+                let label = if sr.name == "." {
+                    format!("⎇ {}", sr.branch)
+                } else {
+                    format!("{}:⎇ {}", sr.name, sr.branch)
+                };
+                let dir_tip = if sr.name == "." { "Root git repo".to_string() } else { format!("{} dir → git repo", sr.name) };
+                let mut r = Row::new().spacing(4);
+                r = r.push(tip(text(label).size(9).font(MONO_FONT).color(tc.purple), &dir_tip));
+                let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
+                let pr_tip = if sr.has_unmerged_pr {
+                    format!("Open PR {}", sr.pr_number)
+                } else if !sr.pr_number.is_empty() {
+                    format!("PR {} merged", sr.pr_number)
+                } else {
+                    "No open PR".to_string()
+                };
+                r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
+                if sr.dirty_files > 0 {
+                    r = r.push(text(format!("· {} files", sr.dirty_files)).size(9).font(MONO_FONT).color(tc.orange));
+                }
+                col = col.push(r);
+            }
+            col.into()
+        } else {
+            let mut r = Row::new().spacing(4);
+            r = r.push(text(format!("⎇ {}", project.branch)).size(10).font(MONO_FONT).color(tc.purple));
+            if let Some(sr) = project.sub_repos.first() {
+                let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
+                let pr_tip = if sr.has_unmerged_pr {
+                    format!("Open PR {}", sr.pr_number)
+                } else if !sr.pr_number.is_empty() {
+                    format!("PR {} merged", sr.pr_number)
+                } else {
+                    "No open PR".to_string()
+                };
+                r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
+            }
+            r = r.push(text("·").size(10).color(tc.text_muted));
+            if project.dirty_files > 0 {
+                r = r.push(text(format!("{} files", project.dirty_files)).size(10).font(MONO_FONT).color(tc.orange));
+            } else {
+                r = r.push(tip(text("✓ clean").size(10).font(MONO_FONT).color(tc.text_muted), "No uncommitted changes"));
+            }
+            r.into()
+        };
+
+        let (cr, cg, cb) = session.color.to_rgb();
+        let session_border_color = c(cr, cg, cb);
+        let border_c = if is_active { session_border_color } else {
+            Color { a: 0.4, ..session_border_color }
+        };
+        let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
+        let hover_bg = t.bg_card_hover;
+        let card_bg = if self.hovered_card == Some((pi, si)) { hover_bg } else { bg_c };
+
+        // Pipeline progress bar
+        let pipeline_bar: Option<Element<'_, Message>> = session.pipeline_run.as_ref().map(|run| {
+            let total = run.steps.len().max(1);
+            let current = run.current_step.min(total - 1);
+            let label = format!("{} · step {}/{}", run.pipeline_name, current + 1, total);
+            let bar_color = sc;
+            let bg_color = Color { a: 0.15, ..bar_color };
+            let frac = ((current + 1) as f32 / total as f32).clamp(0.0, 1.0);
+            let total_w = (self.sidebar_width - 60.0).max(80.0);
+            let filled_w = (total_w * frac).max(2.0);
+            let bg = container(Space::new().width(filled_w).height(4))
+                .style(move |_: &Theme| container::Style {
+                    background: Some(Background::Color(bar_color)),
+                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    ..Default::default()
+                });
+            let track = container(bg).width(total_w).height(4)
+                .style(move |_: &Theme| container::Style {
+                    background: Some(Background::Color(bg_color)),
+                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    ..Default::default()
+                });
+            column![
+                text(label).size(9).font(MONO_FONT).color(tc.text_secondary),
+                track,
+            ].spacing(3).into()
+        });
+
+        // Card content (left, fills) — a transparent select button
+        let select_btn = button({
+            let mut card_col = Column::new().spacing(6);
+            card_col = card_col.push(top);
+            card_col = card_col.push(meta);
+            if let Some(pb) = pipeline_bar {
+                card_col = card_col.push(pb);
+            }
+            if self.renaming_session == Some((pi, si)) {
+                let mut color_row = Row::new().spacing(4);
+                for &clr in session::SessionColor::all() {
+                    let (r, g, b) = clr.to_rgb();
+                    let is_selected = session.color == clr;
+                    let dot_size = if is_selected { 12 } else { 10 };
+                    color_row = color_row.push(
+                        button(text("\u{25CF}").size(dot_size).color(c(r, g, b)))
+                            .on_press(Message::SetSessionColor(pi, si, clr))
+                            .style(button::text).padding([1, 2])
+                    );
+                }
+                card_col = card_col.push(color_row);
+            }
+            card_col
+        })
+            .on_press(Message::SelectSession(pi, si))
+            .style(move |_: &Theme, _status: button::Status| button::Style {
+                background: None,
+                text_color: Color::WHITE,
+                ..Default::default()
+            })
+            .padding([10, 12])
+            .width(Fill);
+
+        let sep_color = Color { a: 0.12, ..session_border_color };
+        let separator = container(Space::new().width(1).height(Fill))
+            .style(move |_: &Theme| container::Style {
+                background: Some(Background::Color(sep_color)),
+                ..Default::default()
+            });
+
+        // Right column: close (✕) always visible + "⋯" floating menu for the rest.
+        let pin_label = if session.pinned { "\u{1F4CC} Unpin" } else { "\u{1F4CC} Pin to top" };
+        let menu_item = |label: &str, color: Color, msg: Message| -> Element<'_, Message> {
+            button(text(label.to_string()).size(12).color(color))
+                .on_press(msg)
+                .style(button::text)
+                .padding([6, 10])
+                .width(Fill)
+                .into()
+        };
+        let menu = container(
+            column![
+                menu_item(pin_label, tc.text_primary, Message::TogglePinSession(pi, si)),
+                menu_item("\u{25FC} Set idle", tc.text_primary, Message::MakeIdle(pi, si)),
+                menu_item("\u{25B6} Run pipeline", tc.blue, Message::OpenRunPipelineModal(pi, si)),
+                menu_item("\u{1F5D1} Delete folder", tc.red, Message::DeleteProjectDir(pi)),
+            ].spacing(0).width(150)
+        )
+        .style({ let t2 = tc.clone(); move |_: &Theme| container::Style {
+            background: Some(Background::Color(t2.bg_card_hover)),
+            border: Border { color: Color { a: 0.5, ..t2.text_muted }, width: 1.0, radius: 6.0.into(), ..Default::default() },
+            ..Default::default()
+        }})
+        .padding(2);
+
+        let dots_btn = tip(
+            button(text("\u{22EF}").size(13).color(tc.text_muted))
+                .on_press(Message::ToggleCardMenu(pi, si))
+                .style(button::text).padding([4, 6]),
+            "More actions"
+        );
+        let menu_open = self.card_menu_open == Some((pi, si));
+
+        let actions = container(column![
+            tip(button(text("\u{2715}").size(11).color(tc.text_muted))
+                    .on_press(Message::KillSession(pi, si))
+                    .style(button::text).padding([4, 6]),
+                "Kill session"),
+            ui_widgets::context_menu(dots_btn, menu, menu_open, Message::CloseCardMenu),
+        ].spacing(0)).padding([4, 2]);
+
+        let card_row = container(
+            row![select_btn, separator, actions].align_y(iced::Alignment::Center)
+        )
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(card_bg)),
+            border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .width(Fill);
+
+        mouse_area(
+            container(card_row)
+                .padding(Padding { top: 2.0, right: 12.0, bottom: 2.0, left: 12.0 })
+        )
+        .on_enter(Message::CardHover(Some((pi, si))))
+        .on_exit(Message::CardHover(None))
+        .into()
     }
 
     fn view_sessions(&self) -> Element<'_, Message> {
@@ -2355,8 +2872,7 @@ impl App {
                         .on_press_maybe(self.active_project.filter(|pi| *pi < self.projects.len())
                             .map(|_| Message::NewSessionInCurrentFolder))
                         .style(button::text).padding(2), "New session in current folder (⌘T)"),
-                tip(button(text("📁").size(12)).on_press(Message::OpenProject).style(button::text).padding(2), "Open folder (⌘O)"),
-                tip(button(text("+").size(14).color(tc.text_muted)).on_press(Message::NewProject).style(button::text).padding(2), "New project (⌘N)"),
+                tip(button(text("+").size(16).color(tc.text_muted)).on_press(Message::ShowOpenModal).style(button::text).padding(2), "New / open project"),
             ].spacing(4).align_y(iced::Alignment::Center),
         ).padding([10, 14]);
 
@@ -2419,6 +2935,28 @@ impl App {
             ].spacing(4)).padding(8).style({let t = tc.clone(); move |_: &Theme| styled_card(&t)}));
         }
 
+        // Pinned sessions float to a dedicated zone at the very top of the
+        // sidebar, across all projects.
+        let mut pinned: Vec<(usize, usize)> = Vec::new();
+        for pi in 0..self.projects.len() {
+            for si in 0..self.projects[pi].sessions.len() {
+                if self.projects[pi].sessions[si].pinned {
+                    pinned.push((pi, si));
+                }
+            }
+        }
+        pinned.sort_by_key(|&(pi, si)| self.projects[pi].sessions[si].sort_key());
+        if !pinned.is_empty() {
+            content = content.push(
+                container(text("\u{1F4CC} PINNED").size(10).font(Font::DEFAULT).color(tc.text_muted))
+                    .padding(Padding { top: 6.0, right: 12.0, bottom: 2.0, left: 14.0 })
+            );
+            for &(pi, si) in &pinned {
+                content = content.push(self.session_card(pi, si));
+            }
+            content = content.push(container(rule::horizontal(1)).padding([4, 12]));
+        }
+
         // Sort projects by hottest session: AWAIT first, then IDLE, then RUN last
         let mut sorted_project_indices: Vec<usize> = (0..self.projects.len()).collect();
         sorted_project_indices.sort_by_key(|&pi| {
@@ -2430,231 +2968,15 @@ impl App {
         });
 
         for &pi in &sorted_project_indices {
-            let project = &self.projects[pi];
             // No project header — sessions shown directly
 
-            // Session cards (sorted: AWAIT first, IDLE middle, RUN last)
-            let mut sorted_indices: Vec<usize> = (0..project.sessions.len()).collect();
-            sorted_indices.sort_by_key(|&i| project.sessions[i].sort_key());
+            // Session cards (sorted: AWAIT first, IDLE middle, RUN last). Pinned
+            // sessions are rendered in the pinned zone above, so skip them here.
+            let mut sorted_indices: Vec<usize> = (0..self.projects[pi].sessions.len()).collect();
+            sorted_indices.sort_by_key(|&i| self.projects[pi].sessions[i].sort_key());
             for &si in &sorted_indices {
-                let session = &project.sessions[si];
-                let is_active = self.active_session == Some((pi, si));
-                let sc = tc.status_color(&session.status);
-                let t = tc.clone();
-
-                // Top row: dot + name + agents + status + kill btn
-                let mut top = Row::new().spacing(6).align_y(iced::Alignment::Center);
-                // Pulsing dot for AWAIT status. While a pipeline is running, swap the
-                // dot for a gear glyph in the same status colour.
-                let dot_color = if session.status == SessionStatus::AwaitingInput && !self.blink_on {
-                    Color { a: 0.3, ..sc }
-                } else {
-                    sc
-                };
-                if session.pipeline_run.is_some() {
-                    top = top.push(text("⚙").size(12).color(dot_color));
-                } else {
-                    top = top.push(text("●").size(8).color(dot_color));
-                }
-                // Session name: inline rename if double-clicked, otherwise clickable text
-                if self.renaming_session == Some((pi, si)) {
-                    top = top.push(
-                        text_input("name", &self.rename_input)
-                            .on_input(Message::RenameSessionInput)
-                            .on_submit(Message::RenameSessionSubmit)
-                            .size(13).padding(2).width(Fill)
-                    );
-                    // Color picker row when renaming
-                    // (will be added after meta below)
-                } else {
-                    top = top.push(text(&session.name).size(13).color(tc.text_primary));
-                    // Pencil icon (visible on card hover)
-                    if self.hovered_card == Some((pi, si)) || is_active {
-                        top = top.push(
-                            tip(
-                                button(text("✎").size(12).color(Color { a: 0.5, ..tc.text_primary }))
-                                    .on_press(Message::StartRenameSession(pi, si))
-                                    .style(button::text).padding([0, 3]),
-                                "Change title and color"
-                            )
-                        );
-                    }
-                }
-                if session.background_agents > 0 {
-                    top = top.push(text(format!("🤖{}", session.background_agents)).size(10).color(tc.green));
-                }
-                top = top.push(Space::new().width(Fill));
-
-                // Meta: show sub-repos with branches, or single branch
-                let meta: Element<'_, Message> = if project.sub_repos.len() > 1 {
-                    let mut col = Column::new().spacing(2);
-                    for sr in &project.sub_repos {
-                        let label = if sr.name == "." {
-                            format!("⎇ {}", sr.branch)
-                        } else {
-                            format!("{}:⎇ {}", sr.name, sr.branch)
-                        };
-                        let dir_tip = if sr.name == "." { "Root git repo".to_string() } else { format!("{} dir → git repo", sr.name) };
-                        let mut r = Row::new().spacing(4);
-                        r = r.push(tip(text(label).size(9).font(MONO_FONT).color(tc.purple), &dir_tip));
-                        // PR dot with tooltip
-                        let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-                        let pr_tip = if sr.has_unmerged_pr {
-                            format!("Open PR {}", sr.pr_number)
-                        } else if !sr.pr_number.is_empty() {
-                            format!("PR {} merged", sr.pr_number)
-                        } else {
-                            "No open PR".to_string()
-                        };
-                        r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
-                        if sr.dirty_files > 0 {
-                            r = r.push(text(format!("· {} files", sr.dirty_files)).size(9).font(MONO_FONT).color(tc.orange));
-                        }
-                        col = col.push(r);
-                    }
-                    col.into()
-                } else {
-                    let mut r = Row::new().spacing(4);
-                    r = r.push(text(format!("⎇ {}", project.branch)).size(10).font(MONO_FONT).color(tc.purple));
-                    // PR dot with tooltip
-                    if let Some(sr) = project.sub_repos.first() {
-                        let pr_color = if sr.has_unmerged_pr { tc.blue } else { tc.text_muted };
-                        let pr_tip = if sr.has_unmerged_pr {
-                            format!("Open PR {}", sr.pr_number)
-                        } else if !sr.pr_number.is_empty() {
-                            format!("PR {} merged", sr.pr_number)
-                        } else {
-                            "No open PR".to_string()
-                        };
-                        r = r.push(tip(text("⬤").size(6).color(pr_color), &pr_tip));
-                    }
-                    r = r.push(text("·").size(10).color(tc.text_muted));
-                    if project.dirty_files > 0 {
-                        r = r.push(text(format!("{} files", project.dirty_files)).size(10).font(MONO_FONT).color(tc.orange));
-                    } else {
-                        r = r.push(tip(text("✓ clean").size(10).font(MONO_FONT).color(tc.text_muted), "No uncommitted changes"));
-                    }
-                    r.into()
-                };
-
-                let (cr, cg, cb) = session.color.to_rgb();
-                let session_border_color = c(cr, cg, cb);
-                let border_c = if is_active { session_border_color } else {
-                    Color { a: 0.4, ..session_border_color }
-                };
-                let bg_c = if is_active { t.bg_card_hover } else { t.bg_card };
-                let hover_bg = t.bg_card_hover;
-                // Whole-card bg incl. hover (painted by the container, not the inner button)
-                let card_bg = if self.hovered_card == Some((pi, si)) { hover_bg } else { bg_c };
-
-                // Pipeline progress bar (built before the card so it can be included).
-                let pipeline_bar: Option<Element<'_, Message>> = session.pipeline_run.as_ref().map(|run| {
-                    let total = run.steps.len().max(1);
-                    let current = run.current_step.min(total - 1);
-                    let label = format!("{} · step {}/{}", run.pipeline_name, current + 1, total);
-                    let bar_color = sc;
-                    let bg_color = Color { a: 0.15, ..bar_color };
-                    let frac = ((current + 1) as f32 / total as f32).clamp(0.0, 1.0);
-                    let total_w = (self.sidebar_width - 60.0).max(80.0);
-                    let filled_w = (total_w * frac).max(2.0);
-                    let bg = container(Space::new().width(filled_w).height(4))
-                        .style(move |_: &Theme| container::Style {
-                            background: Some(Background::Color(bar_color)),
-                            border: Border { radius: 2.0.into(), ..Default::default() },
-                            ..Default::default()
-                        });
-                    let track = container(bg).width(total_w).height(4)
-                        .style(move |_: &Theme| container::Style {
-                            background: Some(Background::Color(bg_color)),
-                            border: Border { radius: 2.0.into(), ..Default::default() },
-                            ..Default::default()
-                        });
-                    column![
-                        text(label).size(9).font(MONO_FONT).color(tc.text_secondary),
-                        track,
-                    ].spacing(3).into()
-                });
-
-                // Card content (left, fills) — a transparent select button
-                let select_btn = button({
-                    let mut card_col = Column::new().spacing(6);
-                    card_col = card_col.push(top);
-                    card_col = card_col.push(meta);
-                    if let Some(pb) = pipeline_bar {
-                        card_col = card_col.push(pb);
-                    }
-                    if self.renaming_session == Some((pi, si)) {
-                        let mut color_row = Row::new().spacing(4);
-                        for &clr in session::SessionColor::all() {
-                            let (r, g, b) = clr.to_rgb();
-                            let is_selected = session.color == clr;
-                            let dot_size = if is_selected { 12 } else { 10 };
-                            color_row = color_row.push(
-                                button(text("\u{25CF}").size(dot_size).color(c(r, g, b)))
-                                    .on_press(Message::SetSessionColor(pi, si, clr))
-                                    .style(button::text).padding([1, 2])
-                            );
-                        }
-                        card_col = card_col.push(color_row);
-                    }
-                    card_col
-                })
-                    .on_press(Message::SelectSession(pi, si))
-                    .style(move |_: &Theme, _status: button::Status| button::Style {
-                        background: None,
-                        text_color: Color::WHITE,
-                        ..Default::default()
-                    })
-                    .padding([10, 12])
-                    .width(Fill);
-
-                // Faint vertical separator between content and actions
-                let sep_color = Color { a: 0.12, ..session_border_color };
-                let separator = container(Space::new().width(1).height(Fill))
-                    .style(move |_: &Theme| container::Style {
-                        background: Some(Background::Color(sep_color)),
-                        ..Default::default()
-                    });
-
-                // Action buttons (right, inside the card)
-                let actions = container(column![
-                    tip(button(text("\u{2715}").size(11).color(tc.text_muted))
-                            .on_press(Message::KillSession(pi, si))
-                            .style(button::text).padding([4, 6]),
-                        "Kill session"),
-                    tip(button(text("\u{25FC}").size(9).color(tc.text_muted))
-                            .on_press(Message::MakeIdle(pi, si))
-                            .style(button::text).padding([4, 6]),
-                        "Set idle"),
-                    tip(button(text("\u{25B6}").size(9).color(tc.blue))
-                            .on_press(Message::OpenRunPipelineModal(pi, si))
-                            .style(button::text).padding([4, 6]),
-                        "Run pipeline"),
-                    tip(button(text("\u{1F5D1}").size(9))
-                            .on_press(Message::DeleteProjectDir(pi))
-                            .style(button::text).padding([4, 6]),
-                        "Delete folder"),
-                ].spacing(0)).padding([4, 2]);
-
-                // Whole card: bordered container holding [content | sep | actions]
-                let card_row = container(
-                    row![select_btn, separator, actions].align_y(iced::Alignment::Center)
-                )
-                .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(card_bg)),
-                    border: Border { color: border_c, width: 1.0, radius: 6.0.into(), ..Default::default() },
-                    ..Default::default()
-                })
-                .width(Fill);
-
-                content = content.push(
-                    mouse_area(
-                        container(card_row)
-                            .padding(Padding { top: 2.0, right: 12.0, bottom: 2.0, left: 12.0 })
-                    )
-                    .on_enter(Message::CardHover(Some((pi, si))))
-                    .on_exit(Message::CardHover(None))
-                );
+                if self.projects[pi].sessions[si].pinned { continue; }
+                content = content.push(self.session_card(pi, si));
             }
 
             // Add session button or inline input
@@ -3259,19 +3581,23 @@ impl App {
                     (tc.text_muted, Color { a: 0.04, ..Color::WHITE }, Color { a: 0.15, ..Color::WHITE })
                 };
                 let icon = if step.interactive { "👤" } else { "▸" };
+                let has_session = run.step_sessions.get(idx).map(|o| o.is_some()).unwrap_or(false);
                 let tip_text = format!(
-                    "Step {}: {}{}\nClick to restart from this step.",
+                    "Step {}: {}{}\nClick to {} from this step.{}",
                     idx + 1,
                     if step.prompt.chars().count() > 60 {
                         let s: String = step.prompt.chars().take(57).collect();
                         format!("{}...", s)
                     } else { step.prompt.clone() },
                     if step.interactive { " (interactive)" } else { "" },
+                    if has_session { "resume" } else { "restart" },
+                    if has_session { "\n↩ Resumes the saved agent session" } else { "" },
                 );
                 chips = chips.push(tip(
                     button(row![
                         text(icon).size(10),
                         text(format!("{}", idx + 1)).size(10).font(MONO_FONT).color(label_color),
+                        text(if has_session { "↩" } else { "" }).size(9).color(tc.green),
                     ].spacing(3).align_y(iced::Alignment::Center))
                         .on_press(Message::PipelineJumpToStep(pi, si, idx))
                         .style(move |_: &Theme, _: button::Status| button::Style {
@@ -3543,11 +3869,33 @@ impl App {
                         .size(13).padding(4),
                     text(format!("{} step{}", p.steps.len(), if p.steps.len() == 1 { "" } else { "s" }))
                         .size(11).color(tc.text_muted),
+                    tip(button(text("⧉").size(13).color(tc.text_muted))
+                            .on_press(Message::StartDuplicatePipeline(idx))
+                            .style(button::text).padding([2, 6]),
+                        "Duplicate pipeline"),
                     button(text("✕").size(11).color(tc.text_muted))
                         .on_press(Message::RemovePipeline(idx))
                         .style(button::text).padding([2, 6]),
                 ].spacing(6).align_y(iced::Alignment::Center)
             );
+            // Duplicate flow: require a name before creating the copy.
+            if self.duplicating_pipeline == Some(idx) {
+                card = card.push(
+                    row![
+                        text("Name:").size(11).color(tc.text_muted),
+                        text_input("new pipeline name", &self.duplicate_name_input)
+                            .on_input(Message::DuplicateNameInput)
+                            .on_submit(Message::DuplicatePipelineSubmit)
+                            .size(12).padding(4),
+                        button(text("Duplicate").size(11).color(tc.green))
+                            .on_press(Message::DuplicatePipelineSubmit)
+                            .style(button::text).padding([2, 6]),
+                        button(text("Cancel").size(11).color(tc.text_muted))
+                            .on_press(Message::CancelDuplicatePipeline)
+                            .style(button::text).padding([2, 6]),
+                    ].spacing(6).align_y(iced::Alignment::Center)
+                );
+            }
             if expanded {
                 // Extra left padding so steps read as nested under the pipeline.
                 let mut steps_col = Column::new().spacing(4)
@@ -3992,6 +4340,12 @@ fn message_label(m: &Message) -> &'static str {
         Message::KillSession(_, _) => "KillSession",
         Message::MakeIdle(_, _) => "MakeIdle",
         Message::CardHover(_) => "CardHover",
+        Message::TogglePinSession(_, _) => "TogglePinSession",
+        Message::ToggleCardMenu(_, _) => "ToggleCardMenu",
+        Message::CloseCardMenu => "CloseCardMenu",
+        Message::ShowOpenModal => "ShowOpenModal",
+        Message::CloseOpenModal => "CloseOpenModal",
+        Message::OpenRecentFolder(_) => "OpenRecentFolder",
         Message::StartRenameSession(_, _) => "StartRenameSession",
         Message::RenameSessionInput(_) => "RenameSessionInput",
         Message::RenameSessionSubmit => "RenameSessionSubmit",
@@ -4065,6 +4419,10 @@ fn message_label(m: &Message) -> &'static str {
         Message::SetNewSessionBackend(_) => "SetNewSessionBackend",
         Message::ReopenTaskLink(_) => "ReopenTaskLink",
         Message::AddPipeline => "AddPipeline",
+        Message::StartDuplicatePipeline(_) => "StartDuplicatePipeline",
+        Message::DuplicateNameInput(_) => "DuplicateNameInput",
+        Message::DuplicatePipelineSubmit => "DuplicatePipelineSubmit",
+        Message::CancelDuplicatePipeline => "CancelDuplicatePipeline",
         Message::RemovePipeline(_) => "RemovePipeline",
         Message::PipelineNameChanged(_, _) => "PipelineNameChanged",
         Message::PipelinePrependChanged(_, _) => "PipelinePrependChanged",
